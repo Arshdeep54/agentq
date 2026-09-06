@@ -5,4 +5,7 @@ edition = "2024"
 
 [dependencies]
 strum = { version = "0.28.0", features = ["derive"] }
-tokio = {version = "1.53.1", features= ["sync","rt","macros","time"]}
+tokio = { version = "1.53.1", features = ["sync", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
