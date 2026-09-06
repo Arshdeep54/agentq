@@ -4,16 +4,23 @@ use std::{
     pin::Pin,
     sync::{Arc, Mutex},
 };
+use strum::EnumCount;
 use tokio::sync::{
     Semaphore,
     mpsc::{Receiver, Sender},
 };
 
-#[derive(Debug, Hash, PartialEq, Eq, Clone, strum::EnumIter)]
+#[derive(Debug, Hash, PartialEq, Eq, Clone, Copy, strum::EnumCount)]
 pub enum Priority {
     Low,
     Medium,
     High,
+}
+
+pub struct Lane {
+    pub(crate) sender: Sender<Job>,
+    pub(crate) receiver: Option<Receiver<Job>>,
+    pub(crate) semaphore: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -46,10 +53,8 @@ pub type JobResult = Result<(), Box<dyn Error + Send + Sync>>;
 pub type Func = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = JobResult> + Send>> + Send>;
 
 pub struct Queue {
-    pub(crate) lanes: HashMap<Priority, Sender<Job>>,
-    pub(crate) receivers: HashMap<Priority, Receiver<Job>>,
+    pub(crate) lanes: [Lane; Priority::COUNT],
     pub(crate) statemap: StateMap,
-    pub(crate) semaphores: HashMap<Priority, Arc<Semaphore>>,
 }
 
 pub struct QueueConfig {
@@ -89,8 +94,7 @@ impl Drop for JobGuard {
         let state = self.outcome.take().unwrap_or(State::Failed {
             reason: "job panicked".to_string(),
         });
-        if let Ok(mut m) = self.statemap.lock() {
-            m.insert(self.key.clone(), state);
-        }
+        let mut m = self.statemap.lock().unwrap_or_else(|e| e.into_inner());
+        m.insert(self.key.clone(), state);
     }
 }

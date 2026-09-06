@@ -1,12 +1,11 @@
-use crate::types::JobGuard;
 pub use crate::types::{
     Accepted, Func, Job, JobResult, Key, Priority, PushError, Queue, QueueConfig, State,
 };
+use crate::types::{JobGuard, Lane};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
-use strum::IntoEnumIterator;
 use tokio::sync::{
     Semaphore,
     mpsc::{self},
@@ -14,48 +13,41 @@ use tokio::sync::{
 mod types;
 
 impl Queue {
-    pub fn builder(queueconfig: QueueConfig) -> Queue {
-        let mut lanes = HashMap::new();
-        let mut receivers = HashMap::new();
-        let mut semaphores = HashMap::new();
-        for p in Priority::iter() {
-            let (sender, receiver) = mpsc::channel(queueconfig.capacity);
-            lanes.insert(p.clone(), sender);
-            receivers.insert(p.clone(), receiver);
-            semaphores.insert(p, Arc::new(Semaphore::new(queueconfig.permits)));
-        }
+    pub fn builder(config: QueueConfig) -> Queue {
+        let lanes = std::array::from_fn(|_| {
+            let (sender, receiver) = mpsc::channel(config.capacity);
+            Lane {
+                sender,
+                receiver: Some(receiver),
+                semaphore: Arc::new(Semaphore::new(config.permits)),
+            }
+        });
 
         Queue {
             lanes,
-            receivers,
             statemap: Arc::new(Mutex::new(HashMap::new())),
-            semaphores,
         }
     }
 
     pub fn run(&mut self) {
-        for (p, mut recv) in self.receivers.drain() {
+        for lane in self.lanes.iter_mut() {
             let statemap = self.statemap.clone();
-            let sem = self
-                .semaphores
-                .get(&p)
-                .expect("builder() creates a semaphore for every Priority variant")
-                .clone();
+            let sem = lane.semaphore.clone();
+            let Some(mut recv) = lane.receiver.take() else {
+                continue;
+            };
+
             tokio::spawn(async move {
                 while let Some(job) = recv.recv().await {
-                    let permit = sem
-                        .clone()
-                        .acquire_owned()
-                        .await
-                        .expect("lane semaphore is never closed");
+                    let Ok(permit) = sem.clone().acquire_owned().await else {
+                        break;
+                    };
                     let statemap = statemap.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
                         {
-                            let mut statemap = statemap
-                                .lock()
-                                .expect("statemap lock poisoned: no code panics while holding it");
+                            let mut statemap = statemap.lock().unwrap_or_else(|e| e.into_inner());
                             statemap.insert(job.key.clone(), State::Processing);
                         }
 
@@ -79,10 +71,7 @@ impl Queue {
 
     pub async fn push(&self, job: Job) -> Result<Accepted, PushError> {
         {
-            let mut statemap = self
-                .statemap
-                .lock()
-                .expect("statemap lock poisoned: no code panics while holding it");
+            let mut statemap = self.statemap.lock().unwrap_or_else(|e| e.into_inner());
 
             match statemap.get(&job.key) {
                 Some(State::Completed) | Some(State::Pending) | Some(State::Processing) => {
@@ -94,20 +83,13 @@ impl Queue {
             }
         }
 
-        let sender = self
-            .lanes
-            .get(&job.priority)
-            .expect("builder() creates a lane for every Priority variant")
-            .clone();
+        let sender = self.lanes[job.priority as usize].sender.clone();
         let key: Key = job.key.clone();
 
         match sender.send(job).await {
             Ok(()) => Ok(Accepted::Queued),
             Err(err) => {
-                let mut statemap = self
-                    .statemap
-                    .lock()
-                    .expect("statemap lock poisoned: no code panics while holding it");
+                let mut statemap = self.statemap.lock().unwrap_or_else(|e| e.into_inner());
                 statemap.insert(
                     key,
                     State::Failed {
@@ -120,10 +102,7 @@ impl Queue {
     }
 
     pub fn state(&self, key: &str) -> Option<State> {
-        let sm = self
-            .statemap
-            .lock()
-            .expect("statemap lock poisoned: no code panics while holding it");
+        let sm = self.statemap.lock().unwrap_or_else(|e| e.into_inner());
         sm.get(key).cloned()
     }
 }
