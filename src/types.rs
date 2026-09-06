@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    error::Error,
     pin::Pin,
     sync::{Arc, Mutex},
 };
@@ -15,12 +16,12 @@ pub enum Priority {
     High,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum State {
     Pending,
     Processing,
     Completed,
-    Failed,
+    Failed { reason: String },
 }
 
 pub struct Job {
@@ -39,9 +40,10 @@ impl Job {
     }
 }
 
-pub(crate) type Key = String;
+pub type Key = String;
 type StateMap = Arc<Mutex<HashMap<Key, State>>>;
-type Func = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+pub type JobResult = Result<(), Box<dyn Error + Send + Sync>>;
+pub type Func = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = JobResult> + Send>> + Send>;
 
 pub struct Queue {
     pub(crate) lanes: HashMap<Priority, Sender<Job>>,
@@ -50,26 +52,43 @@ pub struct Queue {
     pub(crate) semaphores: HashMap<Priority, Arc<Semaphore>>,
 }
 
-#[derive(std::fmt::Debug)]
-pub enum Response {
-    Duplicate,
-    Successful,
-    Failed,
+pub struct QueueConfig {
+    pub capacity: usize,
+    pub permits: usize,
 }
+
+#[derive(Debug)]
+pub enum Accepted {
+    Queued,
+    Duplicate,
+}
+
+#[derive(Debug)]
+pub enum PushError {
+    LaneClosed,
+}
+
+impl std::fmt::Display for PushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PushError::LaneClosed => write!(f, "lane is closed; no worker is running"),
+        }
+    }
+}
+
+impl std::error::Error for PushError {}
 
 pub(crate) struct JobGuard {
     pub(crate) statemap: StateMap,
     pub(crate) key: Key,
-    pub(crate) completed: bool,
+    pub(crate) outcome: Option<State>,
 }
 
 impl Drop for JobGuard {
     fn drop(&mut self) {
-        let state = if self.completed {
-            State::Completed
-        } else {
-            State::Failed
-        };
+        let state = self.outcome.take().unwrap_or(State::Failed {
+            reason: "job panicked".to_string(),
+        });
         if let Ok(mut m) = self.statemap.lock() {
             m.insert(self.key.clone(), state);
         }

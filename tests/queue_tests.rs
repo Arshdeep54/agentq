@@ -1,4 +1,4 @@
-use agentq::{Job, Priority, Queue, Response};
+use agentq::{Accepted, Job, Priority, Queue, QueueConfig, State};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -6,30 +6,36 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn test_duplicate_key() {
-    let mut queue = Queue::builder(5, 5);
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 5,
+        permits: 5,
+    });
     queue.run();
 
     let job1 = Job::new(
         "dup-key".to_string(),
         Priority::High,
-        Box::new(|| Box::pin(async {})),
+        Box::new(|| Box::pin(async { Ok(()) })),
     );
     let job2 = Job::new(
         "dup-key".to_string(),
         Priority::High,
-        Box::new(|| Box::pin(async {})),
+        Box::new(|| Box::pin(async { Ok(()) })),
     );
 
     let first = queue.push(job1).await;
     let second = queue.push(job2).await;
 
-    assert!(matches!(first, Response::Successful));
-    assert!(matches!(second, Response::Duplicate));
+    assert!(matches!(first, Ok(Accepted::Queued)));
+    assert!(matches!(second, Ok(Accepted::Duplicate)));
 }
 
 #[tokio::test]
 async fn test_build() {
-    let mut queue = Queue::builder(5, 5);
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 5,
+        permits: 5,
+    });
     let (sender, receiver) = oneshot::channel();
     let job = Job::new(
         "key".to_string(),
@@ -38,16 +44,19 @@ async fn test_build() {
             Box::pin(async move {
                 println!("job running");
                 let _ = sender.send("done".to_string());
+                Ok(())
             })
         }),
     );
 
     queue.run();
-    let res = queue.push(job).await;
-    println!("{:?}", res);
+    assert!(matches!(queue.push(job).await, Ok(Accepted::Queued)));
 
-    let res = receiver.await;
-    println!("from run {:?}", res);
+    let signal = tokio::time::timeout(Duration::from_secs(2), receiver)
+        .await
+        .expect("job never ran")
+        .expect("job never signalled");
+    assert_eq!(signal, "done");
 }
 
 #[tokio::test]
@@ -55,7 +64,10 @@ async fn concurrency_never_exceeds_lane_permits() {
     const PERMITS: usize = 5;
     const JOB_COUNT: usize = 10;
 
-    let mut queue = Queue::builder(50, PERMITS);
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 50,
+        permits: PERMITS,
+    });
     queue.run();
 
     let running = Arc::new(AtomicUsize::new(0));
@@ -79,10 +91,11 @@ async fn concurrency_never_exceeds_lane_permits() {
 
                     running.fetch_sub(1, Ordering::SeqCst);
                     completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
                 })
             }),
         );
-        queue.push(job).await;
+        assert!(matches!(queue.push(job).await, Ok(Accepted::Queued)));
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -104,7 +117,10 @@ async fn concurrency_never_exceeds_lane_permits() {
 
 #[tokio::test]
 async fn panic_in_one_job_does_not_kill_the_lane() {
-    let mut queue = Queue::builder(10, 5);
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 10,
+        permits: 5,
+    });
     queue.run();
 
     let panicking_job = Job::new(
@@ -112,7 +128,10 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
         Priority::High,
         Box::new(|| Box::pin(async { panic!("boom") })),
     );
-    queue.push(panicking_job).await;
+    assert!(matches!(
+        queue.push(panicking_job).await,
+        Ok(Accepted::Queued)
+    ));
 
     let (tx, rx) = oneshot::channel();
     let survivor_job = Job::new(
@@ -121,10 +140,14 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
         Box::new(move || {
             Box::pin(async move {
                 let _ = tx.send(());
+                Ok(())
             })
         }),
     );
-    queue.push(survivor_job).await;
+    assert!(matches!(
+        queue.push(survivor_job).await,
+        Ok(Accepted::Queued)
+    ));
 
     let result = tokio::time::timeout(Duration::from_secs(2), rx).await;
     assert!(
@@ -134,8 +157,53 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
 }
 
 #[tokio::test]
+async fn job_returning_err_is_recorded_as_failed() {
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 10,
+        permits: 5,
+    });
+    queue.run();
+
+    let (done_tx, done_rx) = oneshot::channel();
+    let job = Job::new(
+        "will-fail".to_string(),
+        Priority::High,
+        Box::new(move || {
+            Box::pin(async move {
+                let _ = done_tx.send(());
+                Err("upstream returned 500".into())
+            })
+        }),
+    );
+    assert!(matches!(queue.push(job).await, Ok(Accepted::Queued)));
+
+    tokio::time::timeout(Duration::from_secs(2), done_rx)
+        .await
+        .expect("job never ran")
+        .expect("job never signalled");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    match queue.state("will-fail") {
+        Some(State::Failed { reason }) => {
+            assert_eq!(reason, "upstream returned 500");
+        }
+        other => panic!("expected Failed with a reason, got {other:?}"),
+    }
+
+    let retry = Job::new(
+        "will-fail".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Ok(()) })),
+    );
+    assert!(matches!(queue.push(retry).await, Ok(Accepted::Queued)));
+}
+
+#[tokio::test]
 async fn panicked_job_key_can_be_retried() {
-    let mut queue = Queue::builder(10, 5);
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 10,
+        permits: 5,
+    });
     queue.run();
 
     let (started_tx, started_rx) = oneshot::channel();
@@ -151,7 +219,7 @@ async fn panicked_job_key_can_be_retried() {
     );
     assert!(matches!(
         queue.push(first_attempt).await,
-        Response::Successful
+        Ok(Accepted::Queued)
     ));
 
     tokio::time::timeout(Duration::from_secs(2), started_rx)
@@ -163,12 +231,12 @@ async fn panicked_job_key_can_be_retried() {
     let retry = Job::new(
         "retry-me".to_string(),
         Priority::High,
-        Box::new(|| Box::pin(async {})),
+        Box::new(|| Box::pin(async { Ok(()) })),
     );
     let response = queue.push(retry).await;
 
     assert!(
-        matches!(response, Response::Successful),
+        matches!(response, Ok(Accepted::Queued)),
         "a panicked job left its key un-retryable, got {response:?}"
     );
 }

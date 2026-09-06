@@ -42,13 +42,16 @@ agentq = "0.1"
 ## Usage
 
 ```rust
-use agentq::{Job, Priority, Queue, Response};
+use agentq::{Accepted, Job, Priority, Queue, QueueConfig};
 
 #[tokio::main]
 async fn main() {
     // capacity: how many jobs may wait in each lane
     // permits:  how many jobs may run concurrently in each lane
-    let mut queue = Queue::builder(100, 5);
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 100,
+        permits: 5,
+    });
     queue.run();
 
     let job = Job::new(
@@ -56,16 +59,34 @@ async fn main() {
         Priority::High,
         Box::new(|| {
             Box::pin(async {
-                // your tool call goes here
+                // your tool call goes here.
+                // return Err(...) to record the job as failed.
+                Ok(())
             })
         }),
     );
 
     match queue.push(job).await {
-        Response::Successful => println!("queued"),
-        Response::Duplicate => println!("already ran or still running, skipped"),
-        Response::Failed => println!("could not queue"),
+        Ok(Accepted::Queued) => println!("queued"),
+        Ok(Accepted::Duplicate) => println!("already ran or still running, skipped"),
+        Err(e) => println!("could not queue: {e}"),
     }
+}
+```
+
+A job returns `Result<(), Box<dyn Error + Send + Sync>>`. Returning `Err`
+records the job as failed with the error's message attached, and leaves the
+key retryable. A panic is caught too, and recorded separately, so an expected
+failure and a bug in your job body don't look the same.
+
+Ask about any key with `state`:
+
+```rust
+match queue.state("charge-order-4821") {
+    Some(State::Completed) => println!("done"),
+    Some(State::Failed { reason }) => println!("failed: {reason}"),
+    Some(other) => println!("in flight: {other:?}"),
+    None => println!("never seen"),
 }
 ```
 
@@ -107,7 +128,6 @@ Being explicit about what this doesn't do yet:
 
 ## Roadmap
 
-- A `status(key)` method, so callers can observe how a job ended
 - Capped retries with exponential backoff
 - Per-lane capacity and permit configuration
 - Time-windowed dedup keys
