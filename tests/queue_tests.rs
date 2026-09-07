@@ -6,11 +6,10 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn test_duplicate_key() {
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 5,
         permits: 5,
     });
-    queue.run();
 
     let job1 = Job::new(
         "dup-key".to_string(),
@@ -32,7 +31,7 @@ async fn test_duplicate_key() {
 
 #[tokio::test]
 async fn test_build() {
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 5,
         permits: 5,
     });
@@ -49,7 +48,6 @@ async fn test_build() {
         }),
     );
 
-    queue.run();
     assert!(matches!(queue.push(job).await, Ok(Accepted::Queued)));
 
     let signal = tokio::time::timeout(Duration::from_secs(2), receiver)
@@ -64,11 +62,10 @@ async fn concurrency_never_exceeds_lane_permits() {
     const PERMITS: usize = 5;
     const JOB_COUNT: usize = 10;
 
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 50,
         permits: PERMITS,
     });
-    queue.run();
 
     let running = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
@@ -117,11 +114,10 @@ async fn concurrency_never_exceeds_lane_permits() {
 
 #[tokio::test]
 async fn panic_in_one_job_does_not_kill_the_lane() {
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 10,
         permits: 5,
     });
-    queue.run();
 
     let panicking_job = Job::new(
         "will-panic".to_string(),
@@ -158,11 +154,10 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
 
 #[tokio::test]
 async fn job_returning_err_is_recorded_as_failed() {
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 10,
         permits: 5,
     });
-    queue.run();
 
     let (done_tx, done_rx) = oneshot::channel();
     let job = Job::new(
@@ -200,11 +195,10 @@ async fn job_returning_err_is_recorded_as_failed() {
 
 #[tokio::test]
 async fn panicked_job_key_can_be_retried() {
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 10,
         permits: 5,
     });
-    queue.run();
 
     let (started_tx, started_rx) = oneshot::channel();
     let first_attempt = Job::new(
@@ -243,11 +237,10 @@ async fn panicked_job_key_can_be_retried() {
 
 #[tokio::test]
 async fn completed_key_returns_cached_output_without_rerunning() {
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 10,
         permits: 5,
     });
-    queue.run();
 
     let runs = Arc::new(AtomicUsize::new(0));
     let (done_tx, done_rx) = oneshot::channel();
@@ -294,5 +287,53 @@ async fn completed_key_returns_cached_output_without_rerunning() {
         runs.load(Ordering::SeqCst),
         1,
         "the cached key was executed a second time"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_pushes_of_same_key_admit_exactly_one() {
+    let queue = Queue::start(QueueConfig {
+        capacity: 10,
+        permits: 5,
+    });
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let queue = queue.clone();
+        let runs = runs.clone();
+        tasks.push(tokio::spawn(async move {
+            let job = Job::new(
+                "racy".to_string(),
+                Priority::High,
+                Box::new(move || {
+                    Box::pin(async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok("done".to_string())
+                    })
+                }),
+            );
+            queue.push(job).await
+        }));
+    }
+
+    let mut queued = 0;
+    for task in tasks {
+        if matches!(task.await.unwrap(), Ok(Accepted::Queued)) {
+            queued += 1;
+        }
+    }
+
+    assert_eq!(
+        queued, 1,
+        "more than one concurrent push was admitted for the same key"
+    );
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the job body executed more than once"
     );
 }

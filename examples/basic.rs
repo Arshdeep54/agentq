@@ -4,11 +4,10 @@ use agentq::{Accepted, Job, Priority, Queue, QueueConfig};
 async fn main() {
     // capacity: how many jobs may wait in each lane
     // permits:  how many jobs may run concurrently in each lane
-    let mut queue = Queue::builder(QueueConfig {
+    let queue = Queue::start(QueueConfig {
         capacity: 100,
         permits: 5,
     });
-    queue.run();
 
     let job = Job::new(
         "charge-order-4821".to_string(),
