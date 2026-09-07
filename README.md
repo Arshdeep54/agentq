@@ -22,9 +22,10 @@ primitives that stop the bleeding, embedded directly in your binary.
 
 ## What it does
 
-- **Idempotency keys.** Every job carries a caller-supplied key. Push the same
-  key while an earlier attempt is queued, running, or already completed, and
-  the second push is rejected instead of executed.
+- **Idempotency keys.** Every job carries a caller-supplied key. Push a key
+  that already completed and you get that job's output back from cache
+  instead of running it again. Push one that's still queued or running and
+  you're told so, rather than starting a duplicate.
 - **Bounded lanes.** Each priority gets its own bounded channel. When a lane
   fills, `push` waits rather than letting the queue grow without limit.
 - **Bounded concurrency.** Each lane has its own semaphore, so the number of
@@ -68,13 +69,16 @@ async fn main() {
 
     match queue.push(job).await {
         Ok(Accepted::Queued) => println!("queued"),
-        Ok(Accepted::Duplicate) => println!("already ran or still running, skipped"),
+        Ok(Accepted::Cached { output }) => println!("already ran, cached: {output}"),
+        Ok(Accepted::InFlight) => println!("already running, skipped"),
         Err(e) => println!("could not queue: {e}"),
     }
 }
 ```
 
-A job returns `Result<(), Box<dyn Error + Send + Sync>>`. Returning `Err`
+A job returns `Result<String, Box<dyn Error + Send + Sync>>`. The `String` is
+cached against the idempotency key, so a later push of the same key gets that
+output back without re-executing. Returning `Err`
 records the job as failed with the error's message attached, and leaves the
 key retryable. A panic is caught too, and recorded separately, so an expected
 failure and a bug in your job body don't look the same.
@@ -83,7 +87,7 @@ Ask about any key with `state`:
 
 ```rust
 match queue.state("charge-order-4821") {
-    Some(State::Completed) => println!("done"),
+    Some(State::Completed { output }) => println!("done: {output}"),
     Some(State::Failed { reason }) => println!("failed: {reason}"),
     Some(other) => println!("in flight: {other:?}"),
     None => println!("never seen"),
@@ -117,8 +121,11 @@ Being explicit about what this doesn't do yet:
 
 - **No automatic retries or backoff.** A failed job is recorded as failed. It
   is not re-attempted for you; re-pushing is the caller's decision.
-- **No key expiry.** Dedup keys are retained for the lifetime of the process.
-  A long-running producer with unbounded distinct keys will grow memory.
+- **No key expiry.** Dedup keys and their cached outputs are retained for the
+  lifetime of the process. A long-running producer with unbounded distinct
+  keys will grow memory.
+- **No way to wait for a job.** There is no handle to await and no completion
+  signal. If you get `InFlight`, your only option is to poll `state(key)`.
 - **Lanes are isolated, not weighted.** Every lane currently gets the same
   capacity and the same permit count, and there is no arbitration between
   them. A `High` job doesn't preempt a `Low` one; they simply don't share a

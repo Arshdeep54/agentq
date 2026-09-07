@@ -3,7 +3,8 @@ use std::fmt;
 #[derive(Debug)]
 pub enum Accepted {
     Queued,
-    Duplicate,
+    Cached { output: String },
+    InFlight,
 }
 
 #[derive(Debug)]

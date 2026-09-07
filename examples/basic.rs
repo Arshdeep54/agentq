@@ -17,14 +17,15 @@ async fn main() {
             Box::pin(async {
                 // your tool call goes here.
                 // return Err(...) to record the job as failed.
-                Ok(())
+                Ok("done".to_string())
             })
         }),
     );
 
     match queue.push(job).await {
         Ok(Accepted::Queued) => println!("queued"),
-        Ok(Accepted::Duplicate) => println!("already ran or still running, skipped"),
+        Ok(Accepted::Cached { output }) => println!("already ran, cached result: {output}"),
+        Ok(Accepted::InFlight) => println!("already running, skipped"),
         Err(e) => println!("could not queue: {e}"),
     }
 }

@@ -71,7 +71,7 @@ impl Queue {
                         };
 
                         guard.outcome = Some(match (job.func)().await {
-                            Ok(()) => State::Completed,
+                            Ok(output) => State::Completed { output },
                             Err(e) => State::Failed {
                                 reason: e.to_string(),
                             },
@@ -87,9 +87,12 @@ impl Queue {
             let mut statemap = self.statemap.lock().unwrap_or_else(|e| e.into_inner());
 
             match statemap.get(&job.key) {
-                Some(State::Completed) | Some(State::Pending) | Some(State::Processing) => {
-                    return Ok(Accepted::Duplicate);
+                Some(State::Completed { output }) => {
+                    return Ok(Accepted::Cached {
+                        output: output.clone(),
+                    });
                 }
+                Some(State::Pending) | Some(State::Processing) => return Ok(Accepted::InFlight),
                 Some(State::Failed { .. }) | None => {
                     statemap.insert(job.key.clone(), State::Pending);
                 }

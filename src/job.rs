@@ -10,7 +10,7 @@ pub enum Priority {
 
 pub type Key = String;
 
-pub type JobResult = Result<(), Box<dyn Error + Send + Sync>>;
+pub type JobResult = Result<String, Box<dyn Error + Send + Sync>>;
 
 pub type Func = Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = JobResult> + Send>> + Send>;
 

@@ -15,19 +15,19 @@ async fn test_duplicate_key() {
     let job1 = Job::new(
         "dup-key".to_string(),
         Priority::High,
-        Box::new(|| Box::pin(async { Ok(()) })),
+        Box::new(|| Box::pin(async { Ok(String::new()) })),
     );
     let job2 = Job::new(
         "dup-key".to_string(),
         Priority::High,
-        Box::new(|| Box::pin(async { Ok(()) })),
+        Box::new(|| Box::pin(async { Ok(String::new()) })),
     );
 
     let first = queue.push(job1).await;
     let second = queue.push(job2).await;
 
     assert!(matches!(first, Ok(Accepted::Queued)));
-    assert!(matches!(second, Ok(Accepted::Duplicate)));
+    assert!(matches!(second, Ok(Accepted::InFlight)));
 }
 
 #[tokio::test]
@@ -44,7 +44,7 @@ async fn test_build() {
             Box::pin(async move {
                 println!("job running");
                 let _ = sender.send("done".to_string());
-                Ok(())
+                Ok("job output".to_string())
             })
         }),
     );
@@ -91,7 +91,7 @@ async fn concurrency_never_exceeds_lane_permits() {
 
                     running.fetch_sub(1, Ordering::SeqCst);
                     completed.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    Ok(String::new())
                 })
             }),
         );
@@ -140,7 +140,7 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
         Box::new(move || {
             Box::pin(async move {
                 let _ = tx.send(());
-                Ok(())
+                Ok(String::new())
             })
         }),
     );
@@ -193,7 +193,7 @@ async fn job_returning_err_is_recorded_as_failed() {
     let retry = Job::new(
         "will-fail".to_string(),
         Priority::High,
-        Box::new(|| Box::pin(async { Ok(()) })),
+        Box::new(|| Box::pin(async { Ok(String::new()) })),
     );
     assert!(matches!(queue.push(retry).await, Ok(Accepted::Queued)));
 }
@@ -231,12 +231,68 @@ async fn panicked_job_key_can_be_retried() {
     let retry = Job::new(
         "retry-me".to_string(),
         Priority::High,
-        Box::new(|| Box::pin(async { Ok(()) })),
+        Box::new(|| Box::pin(async { Ok(String::new()) })),
     );
     let response = queue.push(retry).await;
 
     assert!(
         matches!(response, Ok(Accepted::Queued)),
         "a panicked job left its key un-retryable, got {response:?}"
+    );
+}
+
+#[tokio::test]
+async fn completed_key_returns_cached_output_without_rerunning() {
+    let mut queue = Queue::builder(QueueConfig {
+        capacity: 10,
+        permits: 5,
+    });
+    queue.run();
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (done_tx, done_rx) = oneshot::channel();
+
+    let runs_for_job = runs.clone();
+    let first = Job::new(
+        "cache-me".to_string(),
+        Priority::High,
+        Box::new(move || {
+            Box::pin(async move {
+                runs_for_job.fetch_add(1, Ordering::SeqCst);
+                let _ = done_tx.send(());
+                Ok("the answer".to_string())
+            })
+        }),
+    );
+    assert!(matches!(queue.push(first).await, Ok(Accepted::Queued)));
+
+    tokio::time::timeout(Duration::from_secs(2), done_rx)
+        .await
+        .expect("job never ran")
+        .expect("job never signalled");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let runs_for_second = runs.clone();
+    let second = Job::new(
+        "cache-me".to_string(),
+        Priority::High,
+        Box::new(move || {
+            Box::pin(async move {
+                runs_for_second.fetch_add(1, Ordering::SeqCst);
+                Ok("should never run".to_string())
+            })
+        }),
+    );
+
+    match queue.push(second).await {
+        Ok(Accepted::Cached { output }) => assert_eq!(output, "the answer"),
+        other => panic!("expected cached output, got {other:?}"),
+    }
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the cached key was executed a second time"
     );
 }

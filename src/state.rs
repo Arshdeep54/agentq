@@ -7,7 +7,7 @@ use crate::job::Key;
 pub enum State {
     Pending,
     Processing,
-    Completed,
+    Completed { output: String },
     Failed { reason: String },
 }
 
