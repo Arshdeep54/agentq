@@ -1,13 +1,26 @@
-use agentq::{Accepted, Job, Priority, Queue, QueueConfig};
+use agentq::{Accepted, Job, LaneConfig, Priority, Queue};
 
 #[tokio::main]
 async fn main() {
-    // capacity: how many jobs may wait in each lane
-    // permits:  how many jobs may run concurrently in each lane
-    let queue = Queue::start(QueueConfig {
-        capacity: 100,
-        permits: 5,
-    });
+    // capacity: how many jobs may wait in this lane
+    // permits:  how many jobs may run concurrently in this lane
+    // lanes left unconfigured use LaneConfig::default()
+    let queue = Queue::builder()
+        .lane(
+            Priority::High,
+            LaneConfig {
+                capacity: 32,
+                permits: 1,
+            },
+        )
+        .lane(
+            Priority::Low,
+            LaneConfig {
+                capacity: 128,
+                permits: 4,
+            },
+        )
+        .start();
 
     let job = Job::new(
         "charge-order-4821".to_string(),

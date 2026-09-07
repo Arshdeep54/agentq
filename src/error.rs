@@ -1,13 +1,6 @@
 use std::fmt;
 
 #[derive(Debug)]
-pub enum Accepted {
-    Queued,
-    Cached { output: String },
-    InFlight,
-}
-
-#[derive(Debug)]
 pub enum PushError {
     LaneClosed,
 }

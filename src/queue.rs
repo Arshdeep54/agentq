@@ -3,45 +3,28 @@ use std::sync::{Arc, Mutex};
 
 use strum::EnumCount;
 use tokio::sync::Semaphore;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Sender};
 
-use crate::error::{Accepted, PushError};
+use crate::error::PushError;
 use crate::job::{Job, Key, Priority};
-use crate::state::{JobGuard, State, StateMap};
+use crate::state::{State, StateMap};
+use crate::worker::spawn_worker;
 
-pub struct QueueConfig {
-    pub capacity: usize,
-    pub permits: usize,
+#[derive(Debug)]
+pub enum Accepted {
+    Queued,
+    Cached { output: String },
+    InFlight,
 }
 
-struct Inner {
-    lanes: [Sender<Job>; Priority::COUNT],
-    statemap: StateMap,
-}
 #[derive(Clone)]
 pub struct Queue {
     inner: Arc<Inner>,
 }
 
 impl Queue {
-    pub fn start(config: QueueConfig) -> Queue {
-        let statemap = Arc::new(Mutex::new(HashMap::new()));
-
-        let lanes = std::array::from_fn(|_| {
-            let (sender, receiver) = mpsc::channel(config.capacity);
-
-            spawn_worker(
-                receiver,
-                Arc::new(Semaphore::new(config.permits)),
-                statemap.clone(),
-            );
-
-            sender
-        });
-
-        Queue {
-            inner: Arc::new(Inner { lanes, statemap }),
-        }
+    pub fn builder() -> QueueBuilder {
+        QueueBuilder::default()
     }
 
     pub async fn push(&self, job: Job) -> Result<Accepted, PushError> {
@@ -97,34 +80,62 @@ impl Queue {
     }
 }
 
-fn spawn_worker(mut recv: Receiver<Job>, sem: Arc<Semaphore>, statemap: StateMap) {
-    tokio::spawn(async move {
-        while let Some(job) = recv.recv().await {
-            let Ok(permit) = sem.clone().acquire_owned().await else {
-                break;
-            };
-            let statemap = statemap.clone();
+#[derive(Debug, Clone, Copy)]
+pub struct LaneConfig {
+    pub capacity: usize,
+    pub permits: usize,
+}
 
-            tokio::spawn(async move {
-                let _permit = permit;
-                {
-                    let mut statemap = statemap.lock().unwrap_or_else(|e| e.into_inner());
-                    statemap.insert(job.key.clone(), State::Processing);
-                }
-
-                let mut guard = JobGuard {
-                    statemap,
-                    key: job.key.clone(),
-                    outcome: None,
-                };
-
-                guard.outcome = Some(match (job.func)().await {
-                    Ok(output) => State::Completed { output },
-                    Err(e) => State::Failed {
-                        reason: e.to_string(),
-                    },
-                });
-            });
+impl Default for LaneConfig {
+    fn default() -> LaneConfig {
+        LaneConfig {
+            capacity: 100,
+            permits: 5,
         }
-    });
+    }
+}
+
+#[derive(Debug)]
+pub struct QueueBuilder {
+    lanes: [LaneConfig; Priority::COUNT],
+}
+
+impl Default for QueueBuilder {
+    fn default() -> QueueBuilder {
+        QueueBuilder {
+            lanes: [LaneConfig::default(); Priority::COUNT],
+        }
+    }
+}
+
+impl QueueBuilder {
+    pub fn lane(mut self, priority: Priority, config: LaneConfig) -> Self {
+        self.lanes[priority as usize] = config;
+        self
+    }
+
+    pub fn start(self) -> Queue {
+        let statemap = Arc::new(Mutex::new(HashMap::new()));
+
+        let lanes = std::array::from_fn(|i| {
+            let (sender, receiver) = mpsc::channel(self.lanes[i].capacity);
+
+            spawn_worker(
+                receiver,
+                Arc::new(Semaphore::new(self.lanes[i].permits)),
+                statemap.clone(),
+            );
+
+            sender
+        });
+
+        Queue {
+            inner: Arc::new(Inner { lanes, statemap }),
+        }
+    }
+}
+
+struct Inner {
+    lanes: [Sender<Job>; Priority::COUNT],
+    statemap: StateMap,
 }

@@ -1,4 +1,4 @@
-use agentq::{Accepted, Job, Priority, Queue, QueueConfig, State};
+use agentq::{Accepted, Job, LaneConfig, Priority, Queue, State};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -6,10 +6,7 @@ use tokio::sync::oneshot;
 
 #[tokio::test]
 async fn test_duplicate_key() {
-    let queue = Queue::start(QueueConfig {
-        capacity: 5,
-        permits: 5,
-    });
+    let queue = Queue::builder().start();
 
     let job1 = Job::new(
         "dup-key".to_string(),
@@ -31,10 +28,7 @@ async fn test_duplicate_key() {
 
 #[tokio::test]
 async fn test_build() {
-    let queue = Queue::start(QueueConfig {
-        capacity: 5,
-        permits: 5,
-    });
+    let queue = Queue::builder().start();
     let (sender, receiver) = oneshot::channel();
     let job = Job::new(
         "key".to_string(),
@@ -62,10 +56,15 @@ async fn concurrency_never_exceeds_lane_permits() {
     const PERMITS: usize = 5;
     const JOB_COUNT: usize = 10;
 
-    let queue = Queue::start(QueueConfig {
-        capacity: 50,
-        permits: PERMITS,
-    });
+    let queue = Queue::builder()
+        .lane(
+            Priority::High,
+            LaneConfig {
+                capacity: 50,
+                permits: PERMITS,
+            },
+        )
+        .start();
 
     let running = Arc::new(AtomicUsize::new(0));
     let max_seen = Arc::new(AtomicUsize::new(0));
@@ -114,10 +113,7 @@ async fn concurrency_never_exceeds_lane_permits() {
 
 #[tokio::test]
 async fn panic_in_one_job_does_not_kill_the_lane() {
-    let queue = Queue::start(QueueConfig {
-        capacity: 10,
-        permits: 5,
-    });
+    let queue = Queue::builder().start();
 
     let panicking_job = Job::new(
         "will-panic".to_string(),
@@ -154,10 +150,7 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
 
 #[tokio::test]
 async fn job_returning_err_is_recorded_as_failed() {
-    let queue = Queue::start(QueueConfig {
-        capacity: 10,
-        permits: 5,
-    });
+    let queue = Queue::builder().start();
 
     let (done_tx, done_rx) = oneshot::channel();
     let job = Job::new(
@@ -195,10 +188,7 @@ async fn job_returning_err_is_recorded_as_failed() {
 
 #[tokio::test]
 async fn panicked_job_key_can_be_retried() {
-    let queue = Queue::start(QueueConfig {
-        capacity: 10,
-        permits: 5,
-    });
+    let queue = Queue::builder().start();
 
     let (started_tx, started_rx) = oneshot::channel();
     let first_attempt = Job::new(
@@ -237,10 +227,7 @@ async fn panicked_job_key_can_be_retried() {
 
 #[tokio::test]
 async fn completed_key_returns_cached_output_without_rerunning() {
-    let queue = Queue::start(QueueConfig {
-        capacity: 10,
-        permits: 5,
-    });
+    let queue = Queue::builder().start();
 
     let runs = Arc::new(AtomicUsize::new(0));
     let (done_tx, done_rx) = oneshot::channel();
@@ -292,10 +279,15 @@ async fn completed_key_returns_cached_output_without_rerunning() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_pushes_of_same_key_admit_exactly_one() {
-    let queue = Queue::start(QueueConfig {
-        capacity: 10,
-        permits: 5,
-    });
+    let queue = Queue::builder()
+        .lane(
+            Priority::High,
+            LaneConfig {
+                capacity: 10,
+                permits: 5,
+            },
+        )
+        .start();
     let runs = Arc::new(AtomicUsize::new(0));
 
     let mut tasks = Vec::new();
@@ -335,5 +327,88 @@ async fn concurrent_pushes_of_same_key_admit_exactly_one() {
         runs.load(Ordering::SeqCst),
         1,
         "the job body executed more than once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lanes_have_independent_concurrency_limits() {
+    let queue = Queue::builder()
+        .lane(
+            Priority::Low,
+            LaneConfig {
+                capacity: 50,
+                permits: 1,
+            },
+        )
+        .lane(
+            Priority::High,
+            LaneConfig {
+                capacity: 50,
+                permits: 4,
+            },
+        )
+        .start();
+
+    let low_running = Arc::new(AtomicUsize::new(0));
+    let high_max = Arc::new(AtomicUsize::new(0));
+    let high_running = Arc::new(AtomicUsize::new(0));
+
+    for i in 0..10 {
+        let low_running = low_running.clone();
+        queue
+            .push(Job::new(
+                format!("low-{i}"),
+                Priority::Low,
+                Box::new(move || {
+                    Box::pin(async move {
+                        low_running.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        low_running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(String::new())
+                    })
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        low_running.load(Ordering::SeqCst),
+        1,
+        "Low lane exceeded its single permit"
+    );
+
+    for i in 0..8 {
+        let high_running = high_running.clone();
+        let high_max = high_max.clone();
+        queue
+            .push(Job::new(
+                format!("high-{i}"),
+                Priority::High,
+                Box::new(move || {
+                    Box::pin(async move {
+                        let now = high_running.fetch_add(1, Ordering::SeqCst) + 1;
+                        high_max.fetch_max(now, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        high_running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(String::new())
+                    })
+                }),
+            ))
+            .await
+            .unwrap();
+    }
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert!(
+        high_max.load(Ordering::SeqCst) > 1,
+        "High lane was blocked by the saturated Low lane"
+    );
+    assert!(
+        high_max.load(Ordering::SeqCst) <= 4,
+        "High lane exceeded its permits, saw {}",
+        high_max.load(Ordering::SeqCst)
     );
 }
