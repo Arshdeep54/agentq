@@ -35,7 +35,7 @@ async fn main() {
     );
 
     match queue.push(job).await {
-        Ok(Accepted::Queued) => println!("queued"),
+        Ok(Accepted::Queued(_)) => println!("queued"),
         Ok(Accepted::Cached { output }) => println!("already ran, cached result: {output}"),
         Ok(Accepted::InFlight) => println!("already running, skipped"),
         Err(e) => println!("could not queue: {e}"),

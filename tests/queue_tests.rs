@@ -1,4 +1,4 @@
-use agentq::{Accepted, Job, LaneConfig, Priority, Queue, State};
+use agentq::{Accepted, Job, LaneConfig, Outcome, Priority, Queue, State};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -22,7 +22,7 @@ async fn test_duplicate_key() {
     let first = queue.push(job1).await;
     let second = queue.push(job2).await;
 
-    assert!(matches!(first, Ok(Accepted::Queued)));
+    assert!(matches!(first, Ok(Accepted::Queued(_))));
     assert!(matches!(second, Ok(Accepted::InFlight)));
 }
 
@@ -42,7 +42,7 @@ async fn test_build() {
         }),
     );
 
-    assert!(matches!(queue.push(job).await, Ok(Accepted::Queued)));
+    assert!(matches!(queue.push(job).await, Ok(Accepted::Queued(_))));
 
     let signal = tokio::time::timeout(Duration::from_secs(2), receiver)
         .await
@@ -91,7 +91,7 @@ async fn concurrency_never_exceeds_lane_permits() {
                 })
             }),
         );
-        assert!(matches!(queue.push(job).await, Ok(Accepted::Queued)));
+        assert!(matches!(queue.push(job).await, Ok(Accepted::Queued(_))));
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -122,7 +122,7 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
     );
     assert!(matches!(
         queue.push(panicking_job).await,
-        Ok(Accepted::Queued)
+        Ok(Accepted::Queued(_))
     ));
 
     let (tx, rx) = oneshot::channel();
@@ -138,7 +138,7 @@ async fn panic_in_one_job_does_not_kill_the_lane() {
     );
     assert!(matches!(
         queue.push(survivor_job).await,
-        Ok(Accepted::Queued)
+        Ok(Accepted::Queued(_))
     ));
 
     let result = tokio::time::timeout(Duration::from_secs(2), rx).await;
@@ -163,7 +163,7 @@ async fn job_returning_err_is_recorded_as_failed() {
             })
         }),
     );
-    assert!(matches!(queue.push(job).await, Ok(Accepted::Queued)));
+    assert!(matches!(queue.push(job).await, Ok(Accepted::Queued(_))));
 
     tokio::time::timeout(Duration::from_secs(2), done_rx)
         .await
@@ -183,7 +183,7 @@ async fn job_returning_err_is_recorded_as_failed() {
         Priority::High,
         Box::new(|| Box::pin(async { Ok(String::new()) })),
     );
-    assert!(matches!(queue.push(retry).await, Ok(Accepted::Queued)));
+    assert!(matches!(queue.push(retry).await, Ok(Accepted::Queued(_))));
 }
 
 #[tokio::test]
@@ -203,7 +203,7 @@ async fn panicked_job_key_can_be_retried() {
     );
     assert!(matches!(
         queue.push(first_attempt).await,
-        Ok(Accepted::Queued)
+        Ok(Accepted::Queued(_))
     ));
 
     tokio::time::timeout(Duration::from_secs(2), started_rx)
@@ -220,7 +220,7 @@ async fn panicked_job_key_can_be_retried() {
     let response = queue.push(retry).await;
 
     assert!(
-        matches!(response, Ok(Accepted::Queued)),
+        matches!(response, Ok(Accepted::Queued(_))),
         "a panicked job left its key un-retryable, got {response:?}"
     );
 }
@@ -244,7 +244,7 @@ async fn completed_key_returns_cached_output_without_rerunning() {
             })
         }),
     );
-    assert!(matches!(queue.push(first).await, Ok(Accepted::Queued)));
+    assert!(matches!(queue.push(first).await, Ok(Accepted::Queued(_))));
 
     tokio::time::timeout(Duration::from_secs(2), done_rx)
         .await
@@ -312,7 +312,7 @@ async fn concurrent_pushes_of_same_key_admit_exactly_one() {
 
     let mut queued = 0;
     for task in tasks {
-        if matches!(task.await.unwrap(), Ok(Accepted::Queued)) {
+        if matches!(task.await.unwrap(), Ok(Accepted::Queued(_))) {
             queued += 1;
         }
     }
@@ -411,4 +411,131 @@ async fn lanes_have_independent_concurrency_limits() {
         "High lane exceeded its permits, saw {}",
         high_max.load(Ordering::SeqCst)
     );
+}
+
+#[tokio::test]
+async fn handle_resolves_with_the_job_output() {
+    let queue = Queue::builder().start();
+
+    let job = Job::new(
+        "with-handle".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Ok("the output".to_string()) })),
+    );
+
+    let Ok(Accepted::Queued(handle)) = queue.push(job).await else {
+        panic!("expected the job to be queued");
+    };
+
+    match tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("handle never resolved")
+    {
+        Ok(Outcome::Completed { output }) => assert_eq!(output, "the output"),
+        other => panic!("expected a completed outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn handle_resolves_when_awaited_after_the_job_already_finished() {
+    let queue = Queue::builder().start();
+
+    let job = Job::new(
+        "already-done".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Ok("fast".to_string()) })),
+    );
+
+    let Ok(Accepted::Queued(handle)) = queue.push(job).await else {
+        panic!("expected the job to be queued");
+    };
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    match tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("handle hung after the job had already completed")
+    {
+        Ok(Outcome::Completed { output }) => assert_eq!(output, "fast"),
+        other => panic!("expected a completed outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn handle_reports_failure_when_the_job_returns_err() {
+    let queue = Queue::builder().start();
+
+    let job = Job::new(
+        "will-error".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Err("upstream exploded".into()) })),
+    );
+
+    let Ok(Accepted::Queued(handle)) = queue.push(job).await else {
+        panic!("expected the job to be queued");
+    };
+
+    match tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("handle never resolved")
+    {
+        Ok(Outcome::Failed { reason }) => assert_eq!(reason, "upstream exploded"),
+        other => panic!("expected a failed outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn handle_resolves_when_the_job_panics() {
+    let queue = Queue::builder().start();
+
+    let job = Job::new(
+        "will-panic".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { panic!("boom") })),
+    );
+
+    let Ok(Accepted::Queued(handle)) = queue.push(job).await else {
+        panic!("expected the job to be queued");
+    };
+
+    match tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("handle hung after the job panicked")
+    {
+        Ok(Outcome::Failed { .. }) => {}
+        other => panic!("expected a failed outcome, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn dropping_the_handle_does_not_stop_the_job() {
+    let queue = Queue::builder().start();
+
+    let (done_tx, done_rx) = oneshot::channel();
+    let job = Job::new(
+        "detached".to_string(),
+        Priority::High,
+        Box::new(move || {
+            Box::pin(async move {
+                let _ = done_tx.send(());
+                Ok("ran anyway".to_string())
+            })
+        }),
+    );
+
+    let Ok(Accepted::Queued(handle)) = queue.push(job).await else {
+        panic!("expected the job to be queued");
+    };
+    drop(handle);
+
+    tokio::time::timeout(Duration::from_secs(2), done_rx)
+        .await
+        .expect("job did not run after its handle was dropped")
+        .expect("job never signalled");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    match queue.state("detached") {
+        Some(State::Completed { output }) => assert_eq!(output, "ran anyway"),
+        other => panic!("expected completed state, got {other:?}"),
+    }
 }

@@ -5,14 +5,17 @@ use strum::EnumCount;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::{self, Sender};
 
+use tokio::sync::oneshot;
+
 use crate::error::PushError;
+use crate::handle::JobHandle;
 use crate::job::{Job, Key, Priority};
-use crate::state::{State, StateMap};
+use crate::state::{State, StateMap, WaiterMap};
 use crate::worker::spawn_worker;
 
 #[derive(Debug)]
 pub enum Accepted {
-    Queued,
+    Queued(JobHandle),
     Cached { output: String },
     InFlight,
 }
@@ -28,7 +31,7 @@ impl Queue {
     }
 
     pub async fn push(&self, job: Job) -> Result<Accepted, PushError> {
-        {
+        let receiver = {
             let mut statemap = self
                 .inner
                 .statemap
@@ -46,13 +49,18 @@ impl Queue {
                     statemap.insert(job.key.clone(), State::Pending);
                 }
             }
-        }
+
+            let (sender, receiver) = oneshot::channel();
+            let mut waiters = self.inner.waiters.lock().unwrap_or_else(|e| e.into_inner());
+            waiters.entry(job.key.clone()).or_default().push(sender);
+            receiver
+        };
 
         let sender = self.inner.lanes[job.priority as usize].clone();
         let key: Key = job.key.clone();
 
         match sender.send(job).await {
-            Ok(()) => Ok(Accepted::Queued),
+            Ok(()) => Ok(Accepted::Queued(JobHandle::new(receiver))),
             Err(err) => {
                 let mut statemap = self
                     .inner
@@ -115,7 +123,8 @@ impl QueueBuilder {
     }
 
     pub fn start(self) -> Queue {
-        let statemap = Arc::new(Mutex::new(HashMap::new()));
+        let statemap: StateMap = Arc::new(Mutex::new(HashMap::new()));
+        let waiters: WaiterMap = Arc::new(Mutex::new(HashMap::new()));
 
         let lanes = std::array::from_fn(|i| {
             let (sender, receiver) = mpsc::channel(self.lanes[i].capacity);
@@ -124,13 +133,18 @@ impl QueueBuilder {
                 receiver,
                 Arc::new(Semaphore::new(self.lanes[i].permits)),
                 statemap.clone(),
+                waiters.clone(),
             );
 
             sender
         });
 
         Queue {
-            inner: Arc::new(Inner { lanes, statemap }),
+            inner: Arc::new(Inner {
+                lanes,
+                statemap,
+                waiters,
+            }),
         }
     }
 }
@@ -138,4 +152,5 @@ impl QueueBuilder {
 struct Inner {
     lanes: [Sender<Job>; Priority::COUNT],
     statemap: StateMap,
+    waiters: WaiterMap,
 }
