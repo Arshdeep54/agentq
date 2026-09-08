@@ -1,0 +1,89 @@
+---
+title: Waiting for results
+---
+
+agentq gives you three ways to interact with a job, from fire-and-forget to
+fully synchronous.
+
+## push_and_wait
+
+The simplest, and the right default when you need the output:
+
+```rust
+let output = queue.push_and_wait(job).await?;
+```
+
+It collapses all three push outcomes into one value. Cached results return
+immediately, in-flight work is joined, and new work is queued and awaited.
+
+Failure modes fold into `WaitError`:
+
+```rust
+use agentq::WaitError;
+
+match queue.push_and_wait(job).await {
+    Ok(output) => println!("{output}"),
+    Err(WaitError::Failed { reason }) => eprintln!("job failed: {reason}"),
+    Err(WaitError::Push(err)) => eprintln!("could not queue: {err}"),
+    Err(WaitError::Lost(err)) => eprintln!("lost track of the job: {err}"),
+}
+```
+
+## push
+
+Use `push` when you want to enqueue without blocking, or when you care which of
+the three cases happened:
+
+```rust
+use agentq::Accepted;
+
+match queue.push(job).await? {
+    Accepted::Queued(_handle) => println!("started"),
+    Accepted::Cached { output } => println!("cached: {output}"),
+    Accepted::InFlight(_handle) => println!("joined"),
+}
+```
+
+Dropping the handle is fine. It detaches, exactly like a `tokio::JoinHandle`,
+and never cancels the job.
+
+## Handles
+
+Both `Queued` and `InFlight` carry a `JobHandle`, which is a `Future`:
+
+```rust
+use agentq::Outcome;
+
+if let Accepted::Queued(handle) = queue.push(job).await? {
+    match handle.await? {
+        Outcome::Completed { output } => println!("{output}"),
+        Outcome::Failed { reason } => eprintln!("{reason}"),
+    }
+}
+```
+
+`handle.await` yields `Result<Outcome, JobLost>`. `JobLost` means the worker
+disappeared without reporting, which in practice only happens during runtime
+shutdown.
+
+## Polling instead
+
+If you would rather not hold a handle, ask the queue directly:
+
+```rust
+use agentq::State;
+
+match queue.state("charge-order-4821") {
+    Some(State::Completed { output }) => println!("done: {output}"),
+    Some(State::Failed { reason }) => println!("failed: {reason}"),
+    Some(other) => println!("in flight: {other:?}"),
+    None => println!("never seen"),
+}
+```
+
+`state` takes a `&str` and never blocks.
+
+<Tip>
+  Prefer a handle over polling. `handle.await` parks the task until the job
+  finishes, whereas polling burns cycles guessing.
+</Tip>

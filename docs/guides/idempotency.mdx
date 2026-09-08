@@ -1,0 +1,85 @@
+---
+title: Idempotency keys
+---
+
+Every job carries a key that you choose. The key is what makes a retry
+recognisable as the same work, and it is the only thing agentq uses to decide
+whether a job should run.
+
+## What a push actually returns
+
+```rust
+use agentq::Accepted;
+
+match queue.push(job).await? {
+    Accepted::Queued(handle) => {
+        // new work, now running
+    }
+    Accepted::Cached { output } => {
+        // this key already completed; here is what it returned
+    }
+    Accepted::InFlight(handle) => {
+        // someone else is already running this key
+    }
+}
+```
+
+Those three cases are genuinely different, and collapsing them loses
+information you usually want.
+
+## Cached results, not just rejection
+
+This is the part that makes dedup useful rather than merely defensive.
+
+A queue that only says "already done" leaves a retrying caller stuck: it knows
+not to re-run the work, but it still does not have the answer it needed. agentq
+stores the output against the key, so the retry gets the original result back.
+
+```rust
+let first = queue.push_and_wait(job_a).await?;
+let second = queue.push_and_wait(job_b).await?;
+
+assert_eq!(first, second);
+```
+
+If `job_a` and `job_b` share a key, the closure runs exactly once and both calls
+return the same string.
+
+## Joining work in flight
+
+If a key is pushed while an earlier attempt is still running, the second caller
+does not start a duplicate and does not get turned away. It receives a handle to
+the running job and is notified when that job lands.
+
+Two callers, one execution, both served.
+
+<Note>
+  This is what makes concurrent retries safe. Eight tasks racing to push the
+  same key result in one execution and eight identical answers.
+</Note>
+
+## Choosing a key
+
+The key must be stable across retries of the same logical operation, and
+distinct between operations that genuinely differ. Some workable shapes:
+
+| Situation | Key |
+| --- | --- |
+| A tool call from a model | The provider's tool call id |
+| Enriching a record | `enrich:{record_id}` |
+| A per-file operation | `{path}:{content_hash}` |
+| An idempotent API write | The same key you send as the API's idempotency header |
+
+<Warning>
+  Keys and their cached outputs are retained for the life of the process. A
+  producer generating unbounded distinct keys will grow memory without limit.
+  Time-windowed expiry is planned but not implemented.
+</Warning>
+
+## When a key becomes reusable
+
+A key that ended in `Failed` is retryable: pushing it again queues fresh work.
+That covers both a job that returned `Err` and a job that panicked.
+
+A key that ended in `Completed` is not. It will return its cached output
+forever, or until the process ends.

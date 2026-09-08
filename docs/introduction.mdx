@@ -1,0 +1,58 @@
+---
+title: Introduction
+---
+
+agentq is an embeddable job queue for agent tool calls. It runs inside your own
+process. There is no Redis, no separate service, and nothing to deploy.
+
+It exists to solve one specific problem: **a retried unit of work should not be
+executed twice.**
+
+## The problem
+
+Agent frameworks retry failed tool calls. If a call actually succeeded but the
+acknowledgment was lost, a naive retry runs it again. You get duplicate writes,
+duplicate charges, and corrupted state.
+
+The second problem arrives right behind it. When a batch of calls fails at once,
+the retries all fire at once too, against whatever rate-limited or metered API
+you were talking to.
+
+Durable execution platforms solve both, but they want you to run a separate
+service and adopt their workflow model. agentq is the small version: the
+primitives that stop the bleeding, embedded directly in your binary.
+
+## What you get
+
+<CardGroup cols={2}>
+  <Card title="Idempotency with cached results">
+    Push a key that already completed and you get its output back from cache.
+    Push one that is still running and you join it.
+  </Card>
+  <Card title="Per-lane concurrency">
+    Each priority lane has its own capacity and concurrency limit, so cheap and
+    expensive work get separate budgets.
+  </Card>
+  <Card title="Backpressure">
+    Lanes are bounded. When one fills, pushing waits rather than growing without
+    limit.
+  </Card>
+  <Card title="Failure isolation">
+    A job that errors, or panics outright, records a terminal state and leaves
+    every other job untouched.
+  </Card>
+</CardGroup>
+
+## When not to use it
+
+agentq deliberately does not persist anything and does not coordinate across
+processes. Everything lives in your binary. If it dies, queued work dies with
+it.
+
+If you need work to survive a restart, or a queue shared across machines, you
+want a durable execution platform or a broker-backed queue instead.
+
+<Note>
+  Full API reference is on [docs.rs](https://docs.rs/agentq). These pages cover
+  concepts and usage; docs.rs covers every type and method.
+</Note>

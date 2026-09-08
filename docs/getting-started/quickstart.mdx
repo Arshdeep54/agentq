@@ -1,0 +1,87 @@
+---
+title: Quickstart
+---
+
+A working queue in three steps.
+
+<Steps>
+  <Step title="Start a queue">
+    Workers spawn immediately. There is no separate `run()` call to forget.
+
+    ```rust
+    use agentq::{LaneConfig, Priority, Queue};
+
+    let queue = Queue::builder()
+        .lane(Priority::High, LaneConfig { capacity: 32, permits: 1 })
+        .lane(Priority::Low, LaneConfig { capacity: 128, permits: 4 })
+        .start();
+    ```
+
+    Lanes you do not configure use `LaneConfig::default()`.
+  </Step>
+
+  <Step title="Build a job">
+    A job is an idempotency key, a priority, and an async closure that returns
+    a `String` on success.
+
+    ```rust
+    use agentq::Job;
+
+    let job = Job::new(
+        "charge-order-4821".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async {
+            Ok("charged".to_string())
+        })),
+    );
+    ```
+
+    The key is yours to choose. It is what makes a retry recognisable as the
+    same work.
+  </Step>
+
+  <Step title="Push it and take the result">
+    ```rust
+    let output = queue.push_and_wait(job).await?;
+    ```
+
+    That one call covers three cases: the key already completed and you get the
+    cached output, the key is running and you join it, or the work is queued and
+    you wait for it.
+  </Step>
+</Steps>
+
+## The whole thing
+
+```rust
+use agentq::{Job, LaneConfig, Priority, Queue};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let queue = Queue::builder()
+        .lane(Priority::High, LaneConfig { capacity: 32, permits: 1 })
+        .start();
+
+    let job = Job::new(
+        "charge-order-4821".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Ok("charged".to_string()) })),
+    );
+
+    let output = queue.push_and_wait(job).await?;
+    println!("{output}");
+
+    Ok(())
+}
+```
+
+## Where to go next
+
+<CardGroup cols={2}>
+  <Card title="Idempotency" href="/guides/idempotency">
+    How keys, caching, and joining work in practice.
+  </Card>
+  <Card title="Waiting for results" href="/guides/waiting-for-results">
+    `push` versus `push_and_wait` versus handles.
+  </Card>
+</CardGroup>

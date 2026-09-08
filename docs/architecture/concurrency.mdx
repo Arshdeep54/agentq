@@ -1,0 +1,79 @@
+---
+title: Concurrency model
+---
+
+Where the tasks are, what holds what, and which invariants keep it correct.
+
+## Task topology
+
+Three levels, and each exists for a reason.
+
+**One worker task per lane**, spawned when the queue is built. It loops on
+receiving jobs and never runs job code itself.
+
+**One task per job**, spawned by the worker. This is what provides failure
+isolation: a panic unwinds only that task, and the worker loop above it is
+untouched. Without this nesting, one bad job would kill its lane permanently and
+silently.
+
+**The caller's task**, which may be waiting on a handle or may have moved on.
+
+## Permits
+
+The worker acquires a permit from the lane's semaphore *before* spawning the job
+task, then moves the permit into that task. The permit is released when the job
+task ends.
+
+Acquiring before spawning is deliberate. If the worker spawned first and each
+job task acquired its own permit, the worker could spawn unboundedly many tasks
+that all sit parked on the semaphore. The overflow would move from "jobs waiting
+in a bounded channel" to "live tasks waiting on a semaphore", which is strictly
+worse.
+
+<Note>
+  A permit is never "used" by calling a method. Its existence is the reservation.
+  Holding the value means the slot is taken; dropping it returns the slot. The
+  same RAII pattern as a `MutexGuard`.
+</Note>
+
+## Lock ordering
+
+Two mutexes exist: the state map and the waiter registry. Everything that takes
+both takes **state map first, waiters second**, in `push`, in the job guard, and
+in the claim guard.
+
+Nothing in the type system enforces this. It is the one invariant maintained by
+convention, and reversing it anywhere would introduce a deadlock.
+
+## Locks and await points
+
+No lock is ever held across an `.await`.
+
+`push` does its state-map work inside a scoped block that ends before the send,
+so the guards drop first. This matters for two reasons: `std::sync::MutexGuard`
+is not `Send`, so holding one across an await can make the whole future
+non-`Send`; and holding a lock while awaiting blocks unrelated tasks for the
+duration of an I/O operation.
+
+## Why a synchronous mutex
+
+The state map uses `std::sync::Mutex` rather than `tokio::sync::Mutex`, and that
+choice turns out to be load-bearing.
+
+`Drop` cannot be async. There is no way to `.await` inside a destructor. Both
+guards do their work in `Drop`, and both need the state map. With an async mutex,
+whose `lock()` is an `async fn`, neither guard could be written at all.
+
+The critical sections are single map operations with no user code inside, so a
+blocking lock is also the faster choice. But the deciding factor is that the
+guard pattern depends on it.
+
+## Poisoning
+
+Lock acquisition uses `unwrap_or_else(|e| e.into_inner())` rather than
+`unwrap()`. Poisoning means some other thread panicked while holding the lock,
+which for a map of independent entries carries no useful information. The data is
+intact, so refusing to touch it would be the wrong response.
+
+It also matters that this cannot panic. A panic inside a `Drop` running during
+an unwind aborts the process.

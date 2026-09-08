@@ -1,0 +1,79 @@
+---
+title: Error handling
+---
+
+agentq distinguishes three different kinds of failure, and keeps them separate
+on purpose.
+
+## A job that returns an error
+
+Jobs return `Result<String, Box<dyn Error + Send + Sync>>`. Returning `Err` is
+the normal way to report that the work did not succeed:
+
+```rust
+let job = Job::new(
+    "fetch-profile".to_string(),
+    Priority::High,
+    Box::new(|| Box::pin(async {
+        Err("upstream returned 500".into())
+    })),
+);
+```
+
+The key ends in `State::Failed { reason }` with the error's message attached,
+and the key becomes retryable.
+
+## A job that panics
+
+A panic is caught, recorded, and contained:
+
+- the panicking job's key ends in `Failed`, so it is retryable rather than stuck
+- the lane's worker keeps running and picks up the next job
+- any caller waiting on a handle is notified rather than left hanging
+
+The distinction matters. An `Err` is an expected outcome you chose to report; a
+panic is a bug. Because jobs can return `Err`, panics stay meaningful.
+
+## A job that could not be queued
+
+`push` returns `Result<Accepted, PushError>`. The error case means the work
+never entered a lane at all, which is different from the work failing.
+
+## Everything at once
+
+`push_and_wait` folds all three into `WaitError`, since from the caller's side
+they all mean "I asked for an output and did not get one":
+
+```rust
+use agentq::WaitError;
+
+match queue.push_and_wait(job).await {
+    Ok(output) => println!("{output}"),
+    Err(WaitError::Failed { reason }) => eprintln!("the job failed: {reason}"),
+    Err(WaitError::Push(err)) => eprintln!("could not queue it: {err}"),
+    Err(WaitError::Lost(err)) => eprintln!("lost track of it: {err}"),
+}
+```
+
+`WaitError` implements `std::error::Error` and reports the underlying error
+through `source()`, so it composes with `?` and with `anyhow` or `Box<dyn Error>`.
+
+## Retrying
+
+agentq does not retry for you. A failed job is recorded as failed and left
+alone; re-pushing is your decision.
+
+Because a `Failed` key is retryable, pushing the same key again queues fresh
+work:
+
+```rust
+if let Err(WaitError::Failed { .. }) = queue.push_and_wait(job).await {
+    let output = queue.push_and_wait(retry_job).await?;
+}
+```
+
+<Warning>
+  Automatic retries with backoff are planned but not implemented. Build your own
+  retry loop on top, and be deliberate about it: retrying against a system you
+  have already established is failing can make things worse.
+</Warning>

@@ -1,0 +1,102 @@
+---
+title: Usage patterns
+---
+
+Four shapes that come up repeatedly, and how each maps onto the API.
+
+## Fire and forget
+
+Side-effecting work where nobody waits for an answer. Webhook deliveries, cache
+warming, audit writes.
+
+```rust
+queue.push(job).await?;
+```
+
+Dedup still applies, which is the point: a webhook delivered twice produces one
+execution.
+
+## Request and response
+
+An agent making a tool call, where the model cannot continue without the result.
+
+```rust
+let output = queue.push_and_wait(job).await?;
+```
+
+This is the common case for tool calls, and the reason cached outputs exist. A
+retried call gets the original answer rather than being told "already done" and
+left stuck.
+
+## Batch fan-out
+
+Many independent units, all pushed, all awaited.
+
+```rust
+let mut handles = Vec::new();
+
+for record in records {
+    let job = Job::new(
+        format!("enrich:{}", record.id),
+        Priority::Low,
+        Box::new(move || Box::pin(async move { enrich(record).await })),
+    );
+
+    if let Accepted::Queued(handle) = queue.push(job).await? {
+        handles.push(handle);
+    }
+}
+
+for handle in handles {
+    let _ = handle.await;
+}
+```
+
+Two things worth noticing. `push` still blocks when the lane fills, so
+backpressure holds even while you are collecting handles. And keys that were
+already processed in an earlier run return `Cached` and never enter `handles`,
+which makes a re-run cheap.
+
+<Tip>
+  This is the pattern where dedup pays for itself. Kill the process halfway
+  through a large batch, restart it, and completed work is not repeated.
+</Tip>
+
+## Shared across tasks
+
+`Queue` is cheap to clone and every clone refers to the same queue:
+
+```rust
+let queue = Queue::builder().start();
+
+for chunk in chunks {
+    let queue = queue.clone();
+    tokio::spawn(async move {
+        queue.push_and_wait(job_for(chunk)).await
+    });
+}
+```
+
+No `Arc` wrapper needed. If several of those tasks push the same key
+concurrently, exactly one execution happens and all of them receive its result.
+
+## A pattern to avoid
+
+Do not have a job push to its own queue and await the result:
+
+```rust
+Box::new(move || Box::pin(async move {
+    let inner = queue.push_and_wait(other_job).await?;
+    Ok(inner)
+}))
+```
+
+<Warning>
+  This can deadlock. If every permit in the lane is held by jobs waiting on
+  other jobs in that same lane, nothing can make progress. There is no mechanism
+  to release a permit while waiting.
+</Warning>
+
+If you need this shape, put the inner work in a different lane with its own
+permits, or restructure so the outer job returns and the caller sequences the
+two steps.

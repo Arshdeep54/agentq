@@ -1,0 +1,59 @@
+{
+  "name": "agentq",
+  "colors": {
+    "primary": "#0D9488"
+  },
+  "logo": {
+    "light": "/logo/mark-light.svg",
+    "dark": "/logo/mark-dark.svg"
+  },
+  "favicon": "/favicon.svg",
+  "navbar": {
+    "links": [
+      {
+        "label": "API reference",
+        "href": "https://docs.rs/agentq"
+      }
+    ],
+    "primary": {
+      "label": "GitHub",
+      "href": "https://github.com/Arshdeep54/agentq"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "getting-started/installation",
+              "getting-started/quickstart"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/idempotency",
+              "guides/waiting-for-results",
+              "guides/priority-lanes",
+              "guides/error-handling",
+              "guides/patterns"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/job-lifecycle",
+              "architecture/concurrency",
+              "architecture/guarantees"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

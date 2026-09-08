@@ -1,0 +1,66 @@
+---
+title: Job lifecycle
+---
+
+A key moves through four states, and every path ends in a terminal one.
+
+## The states
+
+| State | Meaning | Pushing this key again |
+| --- | --- | --- |
+| `Pending` | Claimed, queued, not started | `InFlight`, joins the running job |
+| `Processing` | A worker is executing it | `InFlight`, joins the running job |
+| `Completed { output }` | Finished successfully | `Cached`, returns the stored output |
+| `Failed { reason }` | Errored or panicked | `Queued`, runs fresh work |
+
+The split that matters is the last two rows. `Completed` is absorbing: the key
+returns its cached output forever. `Failed` is retryable.
+
+## Claiming
+
+`push` reads and writes the state map under a single lock. It checks whether the
+key exists, decides what to do, writes `Pending`, and registers a waiter, all
+without releasing.
+
+That single critical section is what makes concurrent pushes safe. If the check
+and the claim happened under separate locks, two callers could both read "not
+present" and both enqueue.
+
+## Executing
+
+The worker writes `Processing`, then constructs a guard, then calls the job's
+closure. The guard holds everything needed to finish the key off: the state map,
+the waiter registry, and the key itself.
+
+## Finishing
+
+The guard records the terminal state and notifies waiters when it is dropped,
+not when the job returns. That distinction is the whole design.
+
+`Drop` runs on every exit path, including a panic unwind, so:
+
+- a job that returns `Ok` records `Completed` with its output
+- a job that returns `Err` records `Failed` with the message
+- a job that **panics** records `Failed` too, and every waiter is still notified
+
+Without the guard, a panicking job would leave its key stuck at `Processing`
+forever, which would make it permanently un-retryable and hang anyone waiting.
+
+## Releasing an abandoned claim
+
+There is a second guard covering a narrower case.
+
+Between claiming a key and handing the job to its lane, `push` may block, because
+a full lane makes the send wait. If the caller's future is dropped there, from a
+timeout or a `select!` branch, the key was claimed but no job was ever
+dispatched.
+
+A claim guard, armed when the key is claimed and disarmed once the send
+resolves, removes the state entry and the waiter registration if it is dropped
+while still armed. Cancellation is the only path that leaves it armed.
+
+<Note>
+  Anyone who joined that key while it was claimed receives `JobLost` rather than
+  hanging. The work they were waiting on was abandoned, and saying so is the
+  honest answer.
+</Note>

@@ -1,0 +1,71 @@
+---
+title: Guarantees
+---
+
+What agentq promises, what it does not, and which tests hold each promise in
+place.
+
+## What holds
+
+**A key executes at most once while it is claimed.** Check and claim happen
+under one lock, so concurrent pushes of the same key produce one execution.
+Verified by racing eight tasks on a multi-thread runtime.
+
+**Every job reaches a terminal state.** `Completed` or `Failed`, including when
+the job panics, because the recording happens in a `Drop` impl rather than on
+the success path.
+
+**Everyone waiting gets an answer.** Waiters are notified from the same `Drop`,
+so a panicking job resolves its handles rather than leaving them hanging.
+
+**Concurrency never exceeds a lane's permits.** Verified by tracking the
+high-water mark of simultaneously-running jobs against the configured limit.
+
+**Lanes do not starve each other.** A lane saturated at one permit does not
+prevent another lane from running at four.
+
+**`push` and `push_and_wait` are cancel safe.** Dropping the future leaves no
+claimed key behind: either the job was dispatched and runs, or the claim is
+released.
+
+**One bad job cannot stop a lane.** Panics are isolated to the job's own task.
+
+## What does not hold
+
+**Nothing survives the process.** No persistence, no crash recovery. Queued work
+is lost when the process ends.
+
+**No ordering guarantee across lanes.** Lanes are isolated but not prioritised;
+`High` does not preempt `Low`.
+
+**No ordering guarantee within a lane** once concurrency exceeds one. Jobs run
+concurrently and may finish out of order.
+
+**Keys are retained forever.** No expiry, so unbounded distinct keys grow memory
+without limit.
+
+**Nothing is retried automatically.** A failed job stays failed until you push
+it again.
+
+**In-flight work is abandoned on drop.** There is no graceful shutdown; dropping
+the queue does not drain.
+
+## Known hazard
+
+A job that pushes to its own lane and awaits the result can deadlock, if every
+permit in that lane is held by jobs doing the same thing. There is no mechanism
+to release a permit while waiting.
+
+Durable execution platforms solve this by checkpointing at wait points and
+releasing the concurrency slot. agentq has no equivalent in-process.
+
+## On testing
+
+The invariants above are covered by integration tests exercising the public API,
+including several that only fail under real parallelism and so run on a
+multi-thread runtime.
+
+Two of them were written to reproduce bugs before those bugs were fixed: a
+semaphore that silently limited nothing, and a cancelled push that poisoned its
+key permanently. Both passed every happy-path test while broken, which is the
+argument for testing invariants rather than outcomes.

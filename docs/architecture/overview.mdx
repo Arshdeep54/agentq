@@ -1,0 +1,69 @@
+---
+title: Overview
+---
+
+agentq is four pieces: lanes, a worker per lane, a state map, and a waiter
+registry. Everything else follows from how they fit together.
+
+## The shape
+
+```
+push(job)
+   |
+   v
+[ state map ]  claim the key, register a waiter
+   |
+   v
+[ lane channel ]  bounded, per priority
+   |
+   v
+[ lane worker ]  acquires a permit, then spawns
+   |
+   v
+[ job task ]  runs the closure, records the outcome
+   |
+   +--> state map     (terminal state, cached output)
+   +--> waiter registry  (notify everyone waiting)
+```
+
+## The pieces
+
+**Lanes.** One bounded `tokio::sync::mpsc` channel per `Priority`, stored as a
+fixed array indexed by the enum's discriminant. The array length comes from the
+enum itself, so adding a variant cannot leave a lane missing.
+
+**Workers.** One long-lived task per lane, spawned when the queue is built. It
+receives a job, acquires a permit from that lane's semaphore, then spawns the
+job as its own task. It never runs job code itself.
+
+**State map.** A single `HashMap` from key to `State`, behind a mutex. This is
+both the dedup index and the result cache; `Completed` carries the job's output.
+
+**Waiter registry.** A map from key to a list of one-shot senders. Anyone
+waiting on a key has a sender parked here, and the job's guard drains and
+notifies them all when it finishes.
+
+## Two channels of communication
+
+Worth separating, because they solve different problems.
+
+The **lane channel** hands work from producer to worker. It is bounded, which is
+where backpressure comes from, and it forgets a job the moment it is received.
+
+The **waiter registry** carries results back from worker to caller. It is keyed
+by idempotency key rather than by job, which is what lets several callers share
+one execution.
+
+## Why a semaphore as well as a bounded channel
+
+They limit different things, and you need both.
+
+A bounded channel limits how many jobs may *wait*. Once a worker receives a job,
+the channel slot is free again, so nothing stops the worker from receiving and
+starting the next job immediately.
+
+The semaphore limits how many jobs may *run*. The worker must acquire a permit
+before dispatching, and that permit is held for the job's entire lifetime.
+
+Without the semaphore, a lane with capacity 100 could have a hundred jobs
+executing at once. Without the channel bound, memory grows without limit.

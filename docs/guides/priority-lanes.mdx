@@ -1,0 +1,78 @@
+---
+title: Priority lanes
+---
+
+Every job goes into one of three lanes, chosen by its `Priority`. Each lane has
+its own bounded channel and its own concurrency limit.
+
+## Configuring lanes
+
+```rust
+use agentq::{LaneConfig, Priority, Queue};
+
+let queue = Queue::builder()
+    .lane(Priority::High, LaneConfig { capacity: 32, permits: 1 })
+    .lane(Priority::Low, LaneConfig { capacity: 128, permits: 4 })
+    .start();
+```
+
+Two numbers, and they mean different things:
+
+- **`capacity`** is how many jobs may *wait* in the lane. When it fills, pushing
+  waits. This is your backpressure limit.
+- **`permits`** is how many jobs may *run at once* in the lane. This is your
+  concurrency limit.
+
+A bounded channel alone does not limit concurrency. It controls how much work
+can queue up, not how much can execute simultaneously, which is why the two
+knobs are separate.
+
+Lanes you never configure use `LaneConfig::default()`.
+
+## Why per-lane limits matter
+
+Consider a tool that queries a database which is already struggling. Cheap
+catalog reads are safe to run four at a time; an expensive query plan analysis
+is not safe to run at all concurrently.
+
+```rust
+let queue = Queue::builder()
+    .lane(Priority::Low, LaneConfig { capacity: 128, permits: 4 })
+    .lane(Priority::High, LaneConfig { capacity: 16, permits: 1 })
+    .start();
+```
+
+Now expensive work is serialised while cheap work still flows, and neither
+starves the other.
+
+## Lanes are isolated, not prioritised
+
+This is the important caveat, and it is a deliberate design choice rather than
+an oversight.
+
+Lanes do not share a queue or a concurrency budget, so a saturated `Low` lane
+can never block `High`. But there is **no arbitration between lanes**: a `High`
+job arriving while a `Low` job is queued does not jump ahead of it. They simply
+run in separate lanes with separate limits.
+
+<Note>
+  If you need strict preemption, where urgent work always runs before bulk work,
+  agentq does not currently provide it. Lane arbitration is planned.
+</Note>
+
+What isolation does buy you is the absence of starvation in either direction.
+Every lane always makes progress, which strict priority cannot promise.
+
+## Backpressure in practice
+
+When a lane is full, `push` waits rather than growing the queue:
+
+```rust
+queue.push(job).await?;
+```
+
+That await is a feature. It is the queue telling a producer to slow down instead
+of absorbing unbounded work into memory.
+
+It is also cancel safe. If you wrap it in a timeout and the timeout fires, the
+key is released and can be pushed again.

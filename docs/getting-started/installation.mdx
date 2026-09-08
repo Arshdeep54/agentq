@@ -1,0 +1,44 @@
+---
+title: Installation
+---
+
+Add agentq to your `Cargo.toml`:
+
+```toml
+[dependencies]
+agentq = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+## Requirements
+
+agentq needs a Tokio runtime. It uses `tokio::spawn` internally, so a queue must
+be constructed from inside a runtime.
+
+The crate itself only enables Tokio's `sync` and `rt` features, so it adds very
+little to your dependency tree. You bring whichever runtime flavor you need.
+
+<Warning>
+  `Queue::builder().start()` calls `tokio::spawn`. Calling it outside a runtime
+  panics, the same way `tokio::spawn` itself does.
+</Warning>
+
+## Minimum supported Rust version
+
+agentq requires **Rust 1.85** or newer, because it uses edition 2024. The MSRV
+is verified in CI on every commit, so it is a checked claim rather than an
+aspiration.
+
+## Verifying the install
+
+```rust
+use agentq::Queue;
+
+#[tokio::main]
+async fn main() {
+    let _queue = Queue::builder().start();
+    println!("agentq is wired up");
+}
+```
+
+If that compiles and runs, you are ready for the [quickstart](/getting-started/quickstart).
