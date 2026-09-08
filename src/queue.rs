@@ -10,7 +10,7 @@ use tokio::sync::oneshot;
 use crate::error::{PushError, WaitError};
 use crate::handle::{JobHandle, Outcome};
 use crate::job::{Job, Key, Priority};
-use crate::state::{State, StateMap, WaiterMap};
+use crate::state::{ClaimGuard, State, StateMap, WaiterMap};
 use crate::worker::spawn_worker;
 
 #[derive(Debug)]
@@ -31,7 +31,7 @@ impl Queue {
     }
 
     pub async fn push(&self, job: Job) -> Result<Accepted, PushError> {
-        let receiver = {
+        let (receiver, mut claim) = {
             let mut statemap = self
                 .inner
                 .statemap
@@ -54,7 +54,15 @@ impl Queue {
                     statemap.insert(job.key.clone(), State::Pending);
                     let (sender, receiver) = oneshot::channel();
                     waiters.entry(job.key.clone()).or_default().push(sender);
-                    receiver
+
+                    let claim = ClaimGuard {
+                        statemap: self.inner.statemap.clone(),
+                        waiters: self.inner.waiters.clone(),
+                        key: job.key.clone(),
+                        armed: true,
+                    };
+
+                    (receiver, claim)
                 }
             }
         };
@@ -63,8 +71,12 @@ impl Queue {
         let key: Key = job.key.clone();
 
         match sender.send(job).await {
-            Ok(()) => Ok(Accepted::Queued(JobHandle::new(receiver))),
+            Ok(()) => {
+                claim.armed = false;
+                Ok(Accepted::Queued(JobHandle::new(receiver)))
+            }
             Err(err) => {
+                claim.armed = false;
                 let mut statemap = self
                     .inner
                     .statemap

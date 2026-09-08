@@ -120,6 +120,11 @@ It returns the cached output if the key already completed, joins the running
 job if the key is in flight, and otherwise queues and waits. A job that
 returns `Err` surfaces as `WaitError::Failed`.
 
+Both `push` and `push_and_wait` are cancel safe. Dropping the future before
+it completes, from a timeout or a `select!` branch, leaves no claimed key
+behind: either the job was dispatched and runs to completion, or the key is
+released and can be pushed again.
+
 ## How it works
 
 Each `Priority` gets a bounded `tokio::mpsc` channel and its own
@@ -146,20 +151,19 @@ Being explicit about what this doesn't do yet:
 - **No key expiry.** Dedup keys and their cached outputs are retained for the
   lifetime of the process. A long-running producer with unbounded distinct
   keys will grow memory.
-- **No way to wait for a job.** There is no handle to await and no completion
-  signal. If you get `InFlight`, your only option is to poll `state(key)`.
-- **Lanes are isolated, not weighted.** Every lane currently gets the same
-  capacity and the same permit count, and there is no arbitration between
-  them. A `High` job doesn't preempt a `Low` one; they simply don't share a
-  queue.
+- **Lanes are isolated, not prioritised.** Each lane has its own capacity and
+  concurrency limit, so a saturated lane never starves another. But there is
+  no arbitration between them: a `High` job does not preempt a `Low` one,
+  they simply run in independent lanes.
+- **No graceful shutdown.** Dropping the queue abandons in-flight work.
 - **No persistence and no multi-node coordination.** Everything lives in the
   process. If it dies, queued jobs die with it.
 
 ## Roadmap
 
 - Capped retries with exponential backoff
-- Per-lane capacity and permit configuration
 - Time-windowed dedup keys
+- Graceful shutdown
 
 ## License
 

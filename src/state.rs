@@ -59,3 +59,24 @@ impl Drop for JobGuard {
         }
     }
 }
+
+pub(crate) struct ClaimGuard {
+    pub(crate) statemap: StateMap,
+    pub(crate) waiters: WaiterMap,
+    pub(crate) key: Key,
+    pub(crate) armed: bool,
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let mut statemap = self.statemap.lock().unwrap_or_else(|e| e.into_inner());
+        let mut waiters = self.waiters.lock().unwrap_or_else(|e| e.into_inner());
+
+        statemap.remove(&self.key);
+        waiters.remove(&self.key);
+    }
+}

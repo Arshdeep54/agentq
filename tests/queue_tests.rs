@@ -752,3 +752,116 @@ async fn concurrent_push_and_wait_on_one_key_runs_once_and_serves_everyone() {
 
     assert_eq!(runs.load(Ordering::SeqCst), 1, "the job ran more than once");
 }
+
+fn slow_job(key: &str) -> Job {
+    Job::new(
+        key.to_string(),
+        Priority::High,
+        Box::new(|| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                Ok("slow".to_string())
+            })
+        }),
+    )
+}
+
+#[tokio::test]
+async fn cancelling_a_blocked_push_releases_the_key() {
+    let queue = Queue::builder()
+        .lane(
+            Priority::High,
+            LaneConfig {
+                capacity: 1,
+                permits: 1,
+            },
+        )
+        .start();
+
+    for i in 0..3 {
+        queue
+            .push(slow_job(&format!("filler-{i}")))
+            .await
+            .expect("filler push failed");
+    }
+
+    let blocked = tokio::time::timeout(
+        Duration::from_millis(100),
+        queue.push(slow_job("cancelled-key")),
+    )
+    .await;
+    assert!(
+        blocked.is_err(),
+        "expected the lane to be saturated so the push would block"
+    );
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+
+    match queue.push(slow_job("cancelled-key")).await {
+        Ok(Accepted::Queued(_)) => {}
+        other => panic!("cancelled push left the key claimed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_blocked_push_resolves_a_joined_caller_with_job_lost() {
+    let queue = Queue::builder()
+        .lane(
+            Priority::High,
+            LaneConfig {
+                capacity: 1,
+                permits: 1,
+            },
+        )
+        .start();
+
+    for i in 0..3 {
+        queue
+            .push(slow_job(&format!("filler-{i}")))
+            .await
+            .expect("filler push failed");
+    }
+
+    let claimed = queue.clone();
+    let blocked = tokio::spawn(async move { claimed.push(slow_job("abandoned")).await });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let Ok(Accepted::InFlight(handle)) = queue.push(slow_job("abandoned")).await else {
+        panic!("expected the second caller to join the claimed key");
+    };
+
+    blocked.abort();
+
+    match tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("joined caller hung after the claim was abandoned")
+    {
+        Err(_) => {}
+        other => panic!("expected the joined caller to be told the job was lost, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_successful_push_is_not_undone_by_the_claim_guard() {
+    let queue = Queue::builder().start();
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(2),
+        queue.push_and_wait(Job::new(
+            "not-cancelled".to_string(),
+            Priority::High,
+            Box::new(|| Box::pin(async { Ok("ran".to_string()) })),
+        )),
+    )
+    .await
+    .expect("push_and_wait never returned")
+    .expect("the job should have succeeded");
+
+    assert_eq!(output, "ran");
+
+    match queue.state("not-cancelled") {
+        Some(State::Completed { output }) => assert_eq!(output, "ran"),
+        other => panic!("expected the key to remain recorded, got {other:?}"),
+    }
+}
