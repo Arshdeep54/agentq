@@ -1,3 +1,5 @@
+#![doc = include_str!("../docs/agentq.md")]
+
 mod error;
 mod handle;
 mod job;
