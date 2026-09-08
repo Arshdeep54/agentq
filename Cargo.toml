@@ -10,6 +10,13 @@ documentation = "https://docs.rs/agentq"
 readme = "README.md"
 keywords = ["queue", "async", "tokio", "idempotency", "backpressure"]
 categories = ["asynchronous", "concurrency"]
+exclude = [
+  "docs/**/*.mdx",
+  "docs/docs.json",
+  "docs/favicon.svg",
+  "docs/logo/**",
+  ".github/**",
+]
 
 [dependencies]
 strum = { version = "0.28.0", features = ["derive"] }

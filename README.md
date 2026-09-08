@@ -2,6 +2,7 @@
 
 [![crates.io](https://img.shields.io/crates/v/agentq.svg)](https://crates.io/crates/agentq)
 [![docs.rs](https://docs.rs/agentq/badge.svg)](https://docs.rs/agentq)
+[![guides](https://img.shields.io/badge/guides-agentq.hiesenbug.dev-0D9488)](https://agentq.hiesenbug.dev)
 [![CI](https://github.com/Arshdeep54/agentq/actions/workflows/rust.yml/badge.svg)](https://github.com/Arshdeep54/agentq/actions/workflows/rust.yml)
 [![license](https://img.shields.io/crates/l/agentq.svg)](LICENSE)
 
@@ -64,8 +65,9 @@ let job = Job::new(
 let output = queue.push_and_wait(job).await?;
 ```
 
-Full documentation, including the `push` and handle API for fire-and-forget
-work, is on [docs.rs](https://docs.rs/agentq).
+Guides covering idempotency, priority lanes, error handling and the
+architecture are at **[agentq.hiesenbug.dev](https://agentq.hiesenbug.dev)**.
+The generated API reference is on [docs.rs](https://docs.rs/agentq).
 
 ## Caveats
 

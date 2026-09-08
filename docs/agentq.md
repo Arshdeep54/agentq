@@ -19,6 +19,9 @@ the other end of it.
 - **Failure isolation.** A job that returns an error, or panics outright,
   records a terminal state and leaves every other job untouched.
 
+Longer guides, covering idempotency, lane configuration, error handling and
+the internals, live at <https://agentq.hiesenbug.dev>.
+
 # Getting started
 
 Build a queue, push work into it, and wait for the result:
