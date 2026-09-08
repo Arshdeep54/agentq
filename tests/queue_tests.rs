@@ -23,7 +23,7 @@ async fn test_duplicate_key() {
     let second = queue.push(job2).await;
 
     assert!(matches!(first, Ok(Accepted::Queued(_))));
-    assert!(matches!(second, Ok(Accepted::InFlight)));
+    assert!(matches!(second, Ok(Accepted::InFlight(_))));
 }
 
 #[tokio::test]
@@ -311,9 +311,15 @@ async fn concurrent_pushes_of_same_key_admit_exactly_one() {
     }
 
     let mut queued = 0;
+    let mut handles = Vec::new();
     for task in tasks {
-        if matches!(task.await.unwrap(), Ok(Accepted::Queued(_))) {
-            queued += 1;
+        match task.await.unwrap() {
+            Ok(Accepted::Queued(handle)) => {
+                queued += 1;
+                handles.push(handle);
+            }
+            Ok(Accepted::InFlight(handle)) => handles.push(handle),
+            other => panic!("unexpected push result: {other:?}"),
         }
     }
 
@@ -321,8 +327,18 @@ async fn concurrent_pushes_of_same_key_admit_exactly_one() {
         queued, 1,
         "more than one concurrent push was admitted for the same key"
     );
+    assert_eq!(handles.len(), 8, "some callers were left without a handle");
 
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    for handle in handles {
+        match tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("a caller was never notified")
+        {
+            Ok(Outcome::Completed { output }) => assert_eq!(output, "done"),
+            other => panic!("expected a completed outcome, got {other:?}"),
+        }
+    }
+
     assert_eq!(
         runs.load(Ordering::SeqCst),
         1,
@@ -537,5 +553,99 @@ async fn dropping_the_handle_does_not_stop_the_job() {
     match queue.state("detached") {
         Some(State::Completed { output }) => assert_eq!(output, "ran anyway"),
         other => panic!("expected completed state, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn two_callers_of_one_key_share_a_single_execution_and_both_get_the_output() {
+    let queue = Queue::builder().start();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let runs_for_job = runs.clone();
+    let first_job = Job::new(
+        "shared-key".to_string(),
+        Priority::High,
+        Box::new(move || {
+            Box::pin(async move {
+                runs_for_job.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Ok("shared answer".to_string())
+            })
+        }),
+    );
+    let Ok(Accepted::Queued(first)) = queue.push(first_job).await else {
+        panic!("expected the first push to be queued");
+    };
+
+    let runs_for_second = runs.clone();
+    let second_job = Job::new(
+        "shared-key".to_string(),
+        Priority::High,
+        Box::new(move || {
+            Box::pin(async move {
+                runs_for_second.fetch_add(1, Ordering::SeqCst);
+                Ok("should never run".to_string())
+            })
+        }),
+    );
+    let Ok(Accepted::InFlight(second)) = queue.push(second_job).await else {
+        panic!("expected the second push to join the in-flight job");
+    };
+
+    let first = tokio::time::timeout(Duration::from_secs(2), first)
+        .await
+        .expect("first handle never resolved");
+    let second = tokio::time::timeout(Duration::from_secs(2), second)
+        .await
+        .expect("in-flight handle never resolved");
+
+    match (first, second) {
+        (Ok(Outcome::Completed { output: a }), Ok(Outcome::Completed { output: b })) => {
+            assert_eq!(a, "shared answer");
+            assert_eq!(b, "shared answer");
+        }
+        other => panic!("expected both to complete, got {other:?}"),
+    }
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the job executed more than once"
+    );
+}
+
+#[tokio::test]
+async fn in_flight_handle_reports_failure_of_the_running_job() {
+    let queue = Queue::builder().start();
+
+    let failing = Job::new(
+        "shared-failure".to_string(),
+        Priority::High,
+        Box::new(|| {
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Err("upstream exploded".into())
+            })
+        }),
+    );
+    let Ok(Accepted::Queued(_owner)) = queue.push(failing).await else {
+        panic!("expected the first push to be queued");
+    };
+
+    let joiner = Job::new(
+        "shared-failure".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Ok(String::new()) })),
+    );
+    let Ok(Accepted::InFlight(handle)) = queue.push(joiner).await else {
+        panic!("expected the second push to join the in-flight job");
+    };
+
+    match tokio::time::timeout(Duration::from_secs(2), handle)
+        .await
+        .expect("in-flight handle never resolved")
+    {
+        Ok(Outcome::Failed { reason }) => assert_eq!(reason, "upstream exploded"),
+        other => panic!("expected a failed outcome, got {other:?}"),
     }
 }

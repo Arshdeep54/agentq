@@ -17,7 +17,7 @@ use crate::worker::spawn_worker;
 pub enum Accepted {
     Queued(JobHandle),
     Cached { output: String },
-    InFlight,
+    InFlight(JobHandle),
 }
 
 #[derive(Clone)]
@@ -37,6 +37,7 @@ impl Queue {
                 .statemap
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let mut waiters = self.inner.waiters.lock().unwrap_or_else(|e| e.into_inner());
 
             match statemap.get(&job.key) {
                 Some(State::Completed { output }) => {
@@ -44,16 +45,18 @@ impl Queue {
                         output: output.clone(),
                     });
                 }
-                Some(State::Pending) | Some(State::Processing) => return Ok(Accepted::InFlight),
+                Some(State::Pending) | Some(State::Processing) => {
+                    let (sender, receiver) = oneshot::channel();
+                    waiters.entry(job.key.clone()).or_default().push(sender);
+                    return Ok(Accepted::InFlight(JobHandle::new(receiver)));
+                }
                 Some(State::Failed { .. }) | None => {
                     statemap.insert(job.key.clone(), State::Pending);
+                    let (sender, receiver) = oneshot::channel();
+                    waiters.entry(job.key.clone()).or_default().push(sender);
+                    receiver
                 }
             }
-
-            let (sender, receiver) = oneshot::channel();
-            let mut waiters = self.inner.waiters.lock().unwrap_or_else(|e| e.into_inner());
-            waiters.entry(job.key.clone()).or_default().push(sender);
-            receiver
         };
 
         let sender = self.inner.lanes[job.priority as usize].clone();
@@ -67,12 +70,16 @@ impl Queue {
                     .statemap
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
+                let mut waiters = self.inner.waiters.lock().unwrap_or_else(|e| e.into_inner());
+
                 statemap.insert(
-                    key,
+                    key.clone(),
                     State::Failed {
                         reason: err.to_string(),
                     },
                 );
+                waiters.remove(&key);
+
                 Err(PushError::LaneClosed)
             }
         }
