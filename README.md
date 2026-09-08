@@ -106,9 +106,19 @@ match queue.state("charge-order-4821") {
 }
 ```
 
-`run()` takes `&mut self` and is called once. After that `push` only needs
-`&self`, so you can wrap the queue in an `Arc` and push from as many tasks as
-you like.
+`Queue` is cheap to clone, so share it across tasks with `queue.clone()`
+rather than wrapping it in an `Arc`.
+
+When you need the job's result rather than just queueing it, `push_and_wait`
+collapses all three cases into one call:
+
+```rust
+let output = queue.push_and_wait(job).await?;
+```
+
+It returns the cached output if the key already completed, joins the running
+job if the key is in flight, and otherwise queues and waits. A job that
+returns `Err` surfaces as `WaitError::Failed`.
 
 ## How it works
 

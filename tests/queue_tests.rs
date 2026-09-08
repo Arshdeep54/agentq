@@ -1,4 +1,4 @@
-use agentq::{Accepted, Job, LaneConfig, Outcome, Priority, Queue, State};
+use agentq::{Accepted, Job, LaneConfig, Outcome, Priority, Queue, State, WaitError};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -648,4 +648,107 @@ async fn in_flight_handle_reports_failure_of_the_running_job() {
         Ok(Outcome::Failed { reason }) => assert_eq!(reason, "upstream exploded"),
         other => panic!("expected a failed outcome, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn push_and_wait_returns_the_output() {
+    let queue = Queue::builder().start();
+
+    let job = Job::new(
+        "wait-for-me".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Ok("the answer".to_string()) })),
+    );
+
+    let output = tokio::time::timeout(Duration::from_secs(2), queue.push_and_wait(job))
+        .await
+        .expect("push_and_wait never returned")
+        .expect("expected the job to succeed");
+
+    assert_eq!(output, "the answer");
+}
+
+#[tokio::test]
+async fn push_and_wait_surfaces_a_job_failure_as_an_error() {
+    let queue = Queue::builder().start();
+
+    let job = Job::new(
+        "wait-for-failure".to_string(),
+        Priority::High,
+        Box::new(|| Box::pin(async { Err("upstream exploded".into()) })),
+    );
+
+    match tokio::time::timeout(Duration::from_secs(2), queue.push_and_wait(job))
+        .await
+        .expect("push_and_wait never returned")
+    {
+        Err(WaitError::Failed { reason }) => assert_eq!(reason, "upstream exploded"),
+        other => panic!("expected a job failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn push_and_wait_returns_a_cached_output_without_rerunning() {
+    let queue = Queue::builder().start();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    for _ in 0..3 {
+        let runs = runs.clone();
+        let job = Job::new(
+            "cached-wait".to_string(),
+            Priority::High,
+            Box::new(move || {
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    Ok("computed once".to_string())
+                })
+            }),
+        );
+
+        let output = tokio::time::timeout(Duration::from_secs(2), queue.push_and_wait(job))
+            .await
+            .expect("push_and_wait never returned")
+            .expect("expected the job to succeed");
+
+        assert_eq!(output, "computed once");
+    }
+
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "the job ran more than once across repeated push_and_wait calls"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_push_and_wait_on_one_key_runs_once_and_serves_everyone() {
+    let queue = Queue::builder().start();
+    let runs = Arc::new(AtomicUsize::new(0));
+
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let queue = queue.clone();
+        let runs = runs.clone();
+        tasks.push(tokio::spawn(async move {
+            let job = Job::new(
+                "hot-key".to_string(),
+                Priority::High,
+                Box::new(move || {
+                    Box::pin(async move {
+                        runs.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        Ok("one answer".to_string())
+                    })
+                }),
+            );
+            queue.push_and_wait(job).await
+        }));
+    }
+
+    for task in tasks {
+        let output = task.await.unwrap().expect("a caller did not get an output");
+        assert_eq!(output, "one answer");
+    }
+
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the job ran more than once");
 }

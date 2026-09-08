@@ -7,8 +7,8 @@ use tokio::sync::mpsc::{self, Sender};
 
 use tokio::sync::oneshot;
 
-use crate::error::PushError;
-use crate::handle::JobHandle;
+use crate::error::{PushError, WaitError};
+use crate::handle::{JobHandle, Outcome};
 use crate::job::{Job, Key, Priority};
 use crate::state::{State, StateMap, WaiterMap};
 use crate::worker::spawn_worker;
@@ -82,6 +82,18 @@ impl Queue {
 
                 Err(PushError::LaneClosed)
             }
+        }
+    }
+
+    pub async fn push_and_wait(&self, job: Job) -> Result<String, WaitError> {
+        let handle = match self.push(job).await? {
+            Accepted::Cached { output } => return Ok(output),
+            Accepted::Queued(handle) | Accepted::InFlight(handle) => handle,
+        };
+
+        match handle.await? {
+            Outcome::Completed { output } => Ok(output),
+            Outcome::Failed { reason } => Err(WaitError::Failed { reason }),
         }
     }
 
