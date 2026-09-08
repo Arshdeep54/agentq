@@ -2,6 +2,14 @@
 name = "agentq"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "An embeddable job queue with idempotency keys, per-lane backpressure and bounded concurrency, for agent tool calls."
+repository = "https://github.com/Arshdeep54/agentq"
+documentation = "https://docs.rs/agentq"
+readme = "README.md"
+keywords = ["queue", "async", "tokio", "idempotency", "backpressure"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 strum = { version = "0.28.0", features = ["derive"] }
