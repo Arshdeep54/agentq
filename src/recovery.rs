@@ -242,7 +242,7 @@ mod tests {
             }],
         };
         engine
-            .mount_workflow(workflow, vec![body])
+            .register_workflow(workflow, vec![body])
             .expect("mount workflow");
 
         let count = recover(&engine).await.expect("recover");
@@ -264,6 +264,61 @@ mod tests {
             events
                 .iter()
                 .any(|e| matches!(e, Event::WorkerRecovered { step_index: 0, .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_continues_through_steps_after_the_recovered_one() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let workflow_id = "wf-recover-continue";
+        store.seed_expired_lease(workflow_id, 0, 0, "dead-worker");
+
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let step1_ran = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let step1_ran_clone = step1_ran.clone();
+
+        let step0: StepFunc = Box::new(|| Box::pin(async { Ok("recovered".to_string()) }));
+        let step1: StepFunc = Box::new(move || {
+            step1_ran_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok("second".to_string()) })
+        });
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: workflow_id.to_string(),
+            steps: vec![
+                StepDef { name: "first".into(), retry_policy: no_retry.clone(), timeout: None },
+                StepDef { name: "second".into(), retry_policy: no_retry, timeout: None },
+            ],
+        };
+        engine
+            .register_workflow(workflow, vec![step0, step1])
+            .expect("register workflow");
+
+        recover(&engine).await.expect("recover");
+
+        assert_eq!(
+            step1_ran.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the step after the recovered one should run to completion, not just the recovered step"
+        );
+        let events = store.load_events(workflow_id).expect("load events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::WorkflowCompleted { .. })),
+            "workflow should reach WorkflowCompleted after recovery drives it through"
         );
     }
 }
