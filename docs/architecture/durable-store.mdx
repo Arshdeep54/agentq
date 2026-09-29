@@ -54,11 +54,11 @@ Nothing overwrites a lease it doesn't hold.
 workflow, which step, which attempt — but not the closure that step
 actually runs. Step bodies are `Fn` closures; they can't be serialized into
 SQLite and read back out. Recovery can only re-admit a step for a workflow
-the current process has already registered its bodies for. If the whole
-process (not just one worker) goes down before those bodies are registered
-again on restart, the persisted event log and step status are still there —
-but re-running the step needs your code to reconstruct the `Workflow` and
-hand its bodies to the engine again first.
+the current process has already registered via `WorkflowEngine::
+register_workflow`. If the whole process (not just one worker) goes down,
+the persisted event log and step status are still there — but re-running the
+step needs your code to reconstruct the `Workflow` and re-register its
+bodies with the engine before calling `recover`.
 
 This is the same shape as V1's `Job`: agentq durability is about *state* —
 what happened, what's pending — not about persisting arbitrary Rust

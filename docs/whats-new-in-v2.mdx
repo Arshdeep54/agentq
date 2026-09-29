@@ -1,0 +1,55 @@
+---
+title: What's new in V2
+---
+
+V1 is one job, one attempt, gone when the process exits. V2 adds durable,
+multi-step workflows on top of it — additively. Nothing about `Queue`,
+`Job`, `Priority`, or how V1 behaves has changed; a V1 consumer who never
+touches workflows sees zero difference after upgrading.
+
+## New: durable workflows
+
+- **`Workflow` / `StepDef`.** An ordered list of steps under a stable id,
+  each with its own `RetryPolicy` and optional timeout.
+- **`WorkflowEngine`.** Drives a workflow's steps through the same `Queue`
+  V1 jobs use — it's the only thing that calls `Queue::push` for a workflow
+  step. Retries a failed step per its `RetryPolicy`, entirely on its own;
+  `Queue` itself stays exactly as retry-agnostic as it's always been.
+- **Waiting on external input.** A step can return `WaitForInput` to block
+  on something outside the process — an approval, a webhook, a human.
+  `run` pauses the whole workflow there rather than failing it;
+  `WorkflowEngine::resume` supplies the missing input and continues through
+  the remaining steps.
+- **`DurableStore`.** A trait for where step status and event history live.
+  `SqliteStore` ships as the one concrete implementation, behind the
+  optional `sqlite` Cargo feature — off by default, so a consumer who only
+  wants the raw `Queue` never pulls in `rusqlite`.
+- **Recovery.** `agentq::recover` finds steps whose worker died mid-lease
+  (via `DurableStore::expired_leases`) and re-admits them, once you've
+  re-registered the workflow's bodies with `WorkflowEngine::
+  register_workflow` for the current process.
+
+See the [Durable workflows guide](/guides/workflows) for how the pieces fit
+together, and [Durable store](/architecture/durable-store) for how
+`SqliteStore` is actually structured.
+
+## Install
+
+```toml
+[dependencies]
+agentq = { version = "0.1", features = ["sqlite"] }
+```
+
+Without the `sqlite` feature, nothing changes from V1 — `rusqlite` never
+enters your dependency tree, and none of the new public types cost you
+anything you don't use.
+
+## What didn't change
+
+- `Queue`, `Job`, `Priority`, lanes, backpressure, idempotency — identical
+  to V1. See [Guarantees](/architecture/guarantees) for what still does and
+  doesn't hold at that layer.
+- The raw `Queue` still does not persist anything or retry automatically.
+  Those are workflow-layer features now, not `Queue` features — see
+  [Upcoming](https://github.com/Arshdeep54/agentq#upcoming) for what's still
+  actually planned for `Queue` itself.

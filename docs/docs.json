@@ -29,6 +29,7 @@
             "group": "Getting Started",
             "pages": [
               "introduction",
+              "whats-new-in-v2",
               "getting-started/installation",
               "getting-started/quickstart"
             ]

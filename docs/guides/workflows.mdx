@@ -80,25 +80,31 @@ Box::new(|| Box::pin(async {
 }))
 ```
 
-The engine records this as `StepStatus::Waiting` rather than a hard failure.
-Whatever eventually supplies the missing input calls:
+The engine records this as `StepStatus::Waiting` rather than a hard failure,
+and `run` returns `Ok(())` right there — a `Waiting` step pauses the whole
+workflow, it doesn't fail it. Whatever eventually supplies the missing input
+calls:
 
 ```rust
 engine.resume("onboard-user-42", 0, "approved".to_string()).await?;
 ```
 
-which re-runs the step; `resume_input` reads back whatever the most recent
-`resume` supplied. `resume` is deliberately opaque about what `input`
-means — agentq doesn't know or care whether it's an approval, a webhook
-payload, or something else entirely.
+which re-runs that step and, if it completes, keeps going through the
+remaining steps in order — exactly like the rest of `run` would have, just
+picking up from where it left off. `resume_input` reads back whatever the
+most recent `resume` supplied. `resume` is deliberately opaque about what
+`input` means — agentq doesn't know or care whether it's an approval, a
+webhook payload, or something else entirely.
 
 ## Recovering from a dead worker
 
-If a worker crashes mid-step, its lease on that step eventually expires.
-Call `agentq::recover(&engine)` — typically on startup — to find every
-expired lease via the store and re-admit those steps, logging
-`Event::WorkerRecovered` for each one. Recovery only works for workflows the
-current process actually knows the step bodies for; see
+If a worker crashes mid-step, its lease on that step eventually expires. On
+startup, re-register any workflow that might have been interrupted —
+`engine.register_workflow(workflow, bodies)?` — then call
+`agentq::recover(&engine)` to find every expired lease via the store and
+re-admit those steps, logging `Event::WorkerRecovered` for each one and
+continuing the workflow from there if the step completes. Recovery only
+works for workflows you've re-registered in the current process; see
 [Durable store](/architecture/durable-store) for why that's an inherent
 limit, not an oversight.
 
