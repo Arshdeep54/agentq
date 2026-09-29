@@ -17,6 +17,8 @@ pub use crate::job::{Func, Job, JobResult, Key, Priority};
 pub use crate::queue::{Accepted, LaneConfig, Queue, QueueBuilder};
 pub use crate::state::State;
 pub use crate::store::{DurableStore, StoreError};
+#[cfg(feature = "sqlite")]
+pub use crate::store::SqliteStore;
 pub use crate::workflow::{
     Backoff, Execution, RetryPolicy, StepDef, StepFunc, StepStatus, Workflow,
 };

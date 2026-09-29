@@ -36,3 +36,8 @@ pub trait DurableStore: Send + Sync {
     ) -> Result<(), StoreError>;
     fn expired_leases(&self) -> Result<Vec<crate::Execution>, StoreError>;
 }
+
+#[cfg(feature = "sqlite")]
+mod sqlite;
+#[cfg(feature = "sqlite")]
+pub use sqlite::SqliteStore;

@@ -18,9 +18,13 @@ exclude = [
   ".github/**",
 ]
 
+[features]
+sqlite = ["dep:rusqlite"]
+
 [dependencies]
 strum = { version = "0.28.0", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["sync", "rt"] }
+rusqlite = { version = "0.40.2", optional = true, features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
