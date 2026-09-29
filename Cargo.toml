@@ -23,7 +23,7 @@ sqlite = ["dep:rusqlite"]
 
 [dependencies]
 strum = { version = "0.28.0", features = ["derive"] }
-tokio = { version = "1.53.1", features = ["sync", "rt"] }
+tokio = { version = "1.53.1", features = ["sync", "rt", "time"] }
 rusqlite = { version = "0.40.2", optional = true, features = ["bundled"] }
 
 [dev-dependencies]

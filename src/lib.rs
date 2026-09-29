@@ -1,5 +1,6 @@
 #![doc = include_str!("../docs/agentq.md")]
 
+mod engine;
 mod error;
 mod event;
 mod handle;
@@ -10,6 +11,7 @@ mod store;
 mod worker;
 mod workflow;
 
+pub use crate::engine::{EngineError, WaitForInput, WorkflowEngine};
 pub use crate::error::{JobLost, PushError, WaitError};
 pub use crate::event::{ClaimResult, Event};
 pub use crate::handle::{JobHandle, Outcome};
