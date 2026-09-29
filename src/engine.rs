@@ -115,9 +115,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
 
         let shared_bodies: Vec<SharedStepFunc> = bodies
             .into_iter()
-            .map(|body| {
-                Arc::new(move || body()) as SharedStepFunc
-            })
+            .map(|body| Arc::from(body) as SharedStepFunc)
             .collect();
 
         {
@@ -136,11 +134,14 @@ impl<S: DurableStore> WorkflowEngine<S> {
         })?;
 
         let mut result = Ok(());
-        for step_index in 0..workflow.steps.len() {
-            let step = &workflow.steps[step_index];
-            let body = shared_bodies[step_index].clone();
+        for (step_index, (step, body)) in workflow
+            .steps
+            .iter()
+            .zip(shared_bodies.iter())
+            .enumerate()
+        {
             match self
-                .run_step(&workflow.id, step_index, step, body, 0)
+                .run_step(&workflow.id, step_index, step, body.clone(), 0)
                 .await
             {
                 Ok(()) => {}
