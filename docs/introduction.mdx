@@ -41,16 +41,21 @@ primitives that stop the bleeding, embedded directly in your binary.
     A job that errors, or panics outright, records a terminal state and leaves
     every other job untouched.
   </Card>
+  <Card title="Durable workflows">
+    Ordered multi-step execution with per-step retry, built on top of the same
+    queue, with status and event history persisted by a pluggable store.
+  </Card>
 </CardGroup>
 
 ## When not to use it
 
-agentq deliberately does not persist anything and does not coordinate across
-processes. Everything lives in your binary. If it dies, queued work dies with
-it.
+The raw `Queue` deliberately does not persist anything on its own. Everything
+lives in your binary; if it dies, queued work dies with it. If a step's state
+needs to survive a restart, reach for a [durable
+workflow](/guides/workflows) instead of the raw queue.
 
-If you need work to survive a restart, or a queue shared across machines, you
-want a durable execution platform or a broker-backed queue instead.
+Either way, agentq does not coordinate across processes. If you need a queue
+shared across machines, you want a broker-backed queue instead.
 
 <Note>
   Full API reference is on [docs.rs](https://docs.rs/agentq). These pages cover

@@ -15,13 +15,26 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 agentq needs a Tokio runtime. It uses `tokio::spawn` internally, so a queue must
 be constructed from inside a runtime.
 
-The crate itself only enables Tokio's `sync` and `rt` features, so it adds very
-little to your dependency tree. You bring whichever runtime flavor you need.
+The crate itself only enables Tokio's `sync`, `rt`, and `time` features, so it
+adds very little to your dependency tree. You bring whichever runtime flavor
+you need.
 
 <Warning>
   `Queue::builder().start()` calls `tokio::spawn`. Calling it outside a runtime
   panics, the same way `tokio::spawn` itself does.
 </Warning>
+
+## Optional: durable workflows
+
+`SqliteStore`, used by [durable workflows](/guides/workflows), is behind an
+opt-in feature so it costs nothing if you don't use it:
+
+```toml
+[dependencies]
+agentq = { version = "0.1", features = ["sqlite"] }
+```
+
+Without this feature, `rusqlite` never enters your dependency tree at all.
 
 ## Minimum supported Rust version
 

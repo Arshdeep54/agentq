@@ -32,6 +32,10 @@ released.
 
 ## What does not hold
 
+These are guarantees about the raw `Queue` specifically. A [durable
+workflow](/guides/workflows) trades some of them for persistence, at the cost
+of going through a `DurableStore`.
+
 **Nothing survives the process.** No persistence, no crash recovery. Queued work
 is lost when the process ends.
 
@@ -45,7 +49,8 @@ concurrently and may finish out of order.
 without limit.
 
 **Nothing is retried automatically.** A failed job stays failed until you push
-it again.
+it again. A workflow step *is* retried automatically, per its `RetryPolicy` —
+that logic lives entirely in `WorkflowEngine`, not `Queue`.
 
 **In-flight work is abandoned on drop.** There is no graceful shutdown; dropping
 the queue does not drain.

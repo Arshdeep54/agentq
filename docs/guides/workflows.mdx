@@ -1,0 +1,110 @@
+---
+title: Durable workflows
+---
+
+Everything so far is one job, one attempt, gone when the process exits.
+Workflows add ordered multi-step execution, automatic retry, and state that
+survives a restart — built on top of the same `Queue`, not a replacement
+for it.
+
+## The pieces
+
+A `Workflow` is a stable id plus an ordered list of `StepDef`, each carrying
+a name, a `RetryPolicy`, and an optional timeout:
+
+```rust
+use agentq::{Backoff, RetryPolicy, StepDef, Workflow};
+use std::time::Duration;
+
+let workflow = Workflow {
+    id: "onboard-user-42".to_string(),
+    steps: vec![StepDef {
+        name: "send-welcome-email".to_string(),
+        retry_policy: RetryPolicy {
+            max_attempts: 3,
+            backoff: Backoff::Exponential {
+                base: Duration::from_secs(1),
+                max: Duration::from_secs(30),
+            },
+        },
+        timeout: None,
+    }],
+};
+```
+
+A `WorkflowEngine` runs it, given a `Queue` and a `DurableStore`:
+
+```rust
+use agentq::{Priority, Queue, SqliteStore, WorkflowEngine};
+use std::time::Duration;
+
+let engine = WorkflowEngine::new(
+    Queue::builder().start(),
+    SqliteStore::new("workflows.db")?,
+    "worker-1".to_string(),
+    Duration::from_secs(30), // lease TTL
+    Priority::High,
+);
+
+engine
+    .run(workflow, vec![Box::new(|| Box::pin(async { Ok("sent".to_string()) }))])
+    .await?;
+```
+
+`run` takes the step bodies separately from the `Workflow` definition, the
+same way a `Job`'s closure is separate from its `Priority` and key — the
+`Workflow` is just data, serializable and inspectable, and the bodies are
+the code that can't be.
+
+## The engine is the only thing that pushes to the queue
+
+Each step attempt becomes an ordinary `Job`, keyed
+`{workflow_id}:{step_index}:{attempt}`, pushed through the same `Queue` a
+plain job would use. `Queue` doesn't know a workflow exists — it sees one
+caller pushing jobs, exactly like V1. Retry lives entirely in
+`WorkflowEngine`: a failed attempt gets a fresh key and a fresh push after
+the `RetryPolicy`'s backoff, up to `max_attempts`. `Queue` itself is still
+exactly as retry-agnostic as it always was.
+
+## Waiting on something outside the process
+
+A step that can't finish synchronously — an approval, a webhook, a human —
+returns `WaitForInput` instead of completing or failing:
+
+```rust
+use agentq::WaitForInput;
+
+Box::new(|| Box::pin(async {
+    Err(Box::new(WaitForInput("waiting on manager approval".to_string()))
+        as Box<dyn std::error::Error + Send + Sync>)
+}))
+```
+
+The engine records this as `StepStatus::Waiting` rather than a hard failure.
+Whatever eventually supplies the missing input calls:
+
+```rust
+engine.resume("onboard-user-42", 0, "approved".to_string()).await?;
+```
+
+which re-runs the step; `resume_input` reads back whatever the most recent
+`resume` supplied. `resume` is deliberately opaque about what `input`
+means — agentq doesn't know or care whether it's an approval, a webhook
+payload, or something else entirely.
+
+## Recovering from a dead worker
+
+If a worker crashes mid-step, its lease on that step eventually expires.
+Call `agentq::recover(&engine)` — typically on startup — to find every
+expired lease via the store and re-admit those steps, logging
+`Event::WorkerRecovered` for each one. Recovery only works for workflows the
+current process actually knows the step bodies for; see
+[Durable store](/architecture/durable-store) for why that's an inherent
+limit, not an oversight.
+
+<Note>
+  `DurableStore` is a trait. `SqliteStore` is the implementation this crate
+  ships, behind the `sqlite` feature — see [Durable
+  store](/architecture/durable-store) for how it's structured, and for
+  writing your own backend.
+</Note>

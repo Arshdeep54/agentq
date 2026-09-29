@@ -40,7 +40,8 @@
               "guides/waiting-for-results",
               "guides/priority-lanes",
               "guides/error-handling",
-              "guides/patterns"
+              "guides/patterns",
+              "guides/workflows"
             ]
           },
           {
@@ -49,7 +50,8 @@
               "architecture/overview",
               "architecture/job-lifecycle",
               "architecture/concurrency",
-              "architecture/guarantees"
+              "architecture/guarantees",
+              "architecture/durable-store"
             ]
           }
         ]

@@ -40,6 +40,13 @@ primitives that stop the bleeding, embedded directly in your binary.
   records a terminal state and leaves every other job untouched.
 - **Cancel safe.** Dropping a `push` future part-way through leaves no
   claimed key behind.
+- **Durable workflows.** An ordered list of steps with per-step retry and
+  backoff, driven through the same queue, with status and event history
+  persisted by a pluggable `DurableStore`. A `Waiting` step can block on
+  something outside the process (an approval, a webhook) and be unblocked
+  later with `resume`. Ships with a SQLite-backed store behind the optional
+  `sqlite` feature — off by default, so consumers who only want the raw
+  queue never pull in `rusqlite`.
 
 ## Quick start
 
@@ -69,6 +76,54 @@ Guides covering idempotency, priority lanes, error handling and the
 architecture are at **[agentq.hiesenbug.dev](https://agentq.hiesenbug.dev)**.
 The generated API reference is on [docs.rs](https://docs.rs/agentq).
 
+## Durable workflows
+
+For multi-step work that needs to survive a restart, enable the `sqlite`
+feature:
+
+```toml
+[dependencies]
+agentq = { version = "0.1", features = ["sqlite"] }
+```
+
+```rust
+use agentq::{Backoff, Queue, RetryPolicy, SqliteStore, StepDef, Workflow, WorkflowEngine};
+use std::time::Duration;
+
+let engine = WorkflowEngine::new(
+    Queue::builder().start(),
+    SqliteStore::new("workflows.db")?,
+    "worker-1".to_string(),
+    Duration::from_secs(30),
+    agentq::Priority::High,
+);
+
+let workflow = Workflow {
+    id: "onboard-user-42".to_string(),
+    steps: vec![StepDef {
+        name: "send-welcome-email".to_string(),
+        retry_policy: RetryPolicy {
+            max_attempts: 3,
+            backoff: Backoff::Fixed(Duration::from_secs(5)),
+        },
+        timeout: None,
+    }],
+};
+
+engine.run(workflow, vec![Box::new(|| Box::pin(async { Ok("sent".to_string()) }))]).await?;
+```
+
+The engine retries a failed step per its `RetryPolicy` and records every
+transition as an `Event`, both through the same `Queue` and `Job` V1 uses —
+`Queue` itself stays exactly as it was, retry-agnostic and in-memory. A step
+that returns `WaitForInput` parks as `Waiting` until you call
+`engine.resume(workflow_id, step_index, input)`; a step whose worker died
+mid-lease gets picked back up by `agentq::recover(&engine)`.
+
+`DurableStore` is a trait — `SqliteStore` is the one implementation this
+crate ships, but a consumer who wants Postgres or an in-memory store for
+tests can implement it directly.
+
 ## Caveats
 
 A job that pushes to its own queue and waits on the result can deadlock, if
@@ -78,13 +133,16 @@ Keys and their cached outputs are retained for the life of the process, so a
 producer with unbounded distinct keys grows memory. Dropping the queue
 abandons in-flight work.
 
-agentq deliberately does not persist anything and does not coordinate across
-processes. If you need durability or a queue shared across machines, you want
-a different tool.
+`Queue` itself deliberately does not persist anything and does not coordinate
+across machines. For a step's state to survive a restart, use a `Workflow`
+with a `DurableStore` instead of the raw `Queue` — but agentq still does not
+coordinate across machines; if you need that, you want a different tool.
 
 ## Upcoming
 
-- Capped retries with exponential backoff
+- Capped retries with exponential backoff for the raw `Queue` — a plain job
+  is still recorded as failed and not re-attempted; workflows already have
+  this via `RetryPolicy`
 - Time-windowed keys, so cached outputs expire
 - Graceful shutdown, draining in-flight work before exit
 - Arbitration between lanes, so `High` can preempt `Low`

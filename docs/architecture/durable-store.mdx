@@ -1,0 +1,72 @@
+---
+title: Durable store
+---
+
+`WorkflowEngine` doesn't know how step state is stored. It talks to a
+`DurableStore` trait, and everything about persistence lives on the other
+side of that boundary.
+
+```rust
+pub trait DurableStore: Send + Sync {
+    fn append_event(&self, event: &Event) -> Result<(), StoreError>;
+    fn load_events(&self, workflow_id: &str) -> Result<Vec<Event>, StoreError>;
+    fn claim_step(&self, workflow_id: &str, step_index: usize, worker_id: &str, lease_ttl: Duration)
+        -> Result<ClaimResult, StoreError>;
+    fn renew_lease(&self, workflow_id: &str, step_index: usize, worker_id: &str, lease_ttl: Duration)
+        -> Result<(), StoreError>;
+    fn expired_leases(&self) -> Result<Vec<Execution>, StoreError>;
+}
+```
+
+`SqliteStore` is the one implementation agentq ships, behind the `sqlite`
+Cargo feature. A consumer who only wants V1's `Queue` never pulls in
+`rusqlite`; a consumer who wants Postgres, or an in-memory store for tests,
+implements the trait directly — the engine doesn't care what's behind it.
+
+## Two tables, one source of truth
+
+`SqliteStore` keeps an append-only `events` table and a `steps` table, and
+only one of them is authoritative.
+
+`events` is the log: one row per `Event`, never updated or deleted. `steps`
+is a projection, one row per `(workflow_id, step_index)`, holding just
+enough — current status, lease holder, lease expiry — to answer
+`claim_step` and `expired_leases` as an indexed query instead of replaying
+the entire log on every call.
+
+`append_event` writes both in one SQLite transaction, so the projection can
+never drift from the log it's derived from. If `steps` were ever lost or
+corrupted, replaying `events` rebuilds it — that's a recovery path, not
+something the engine does on the hot path.
+
+## Claiming is compare-and-swap, not a write
+
+Two workers can call `claim_step` for the same step at the same moment.
+`SqliteStore` resolves this as a real CAS inside the transaction: if the
+step is already `Completed`, the caller gets `ClaimResult::AlreadyCompleted`
+with the cached output; if it's leased to someone else and that lease
+hasn't expired, `ClaimResult::HeldByOther`; otherwise the caller claims it.
+Nothing overwrites a lease it doesn't hold.
+
+## Why recovery needs the step bodies in memory
+
+`expired_leases` gives `agentq::recover` back an `Execution` — which
+workflow, which step, which attempt — but not the closure that step
+actually runs. Step bodies are `Fn` closures; they can't be serialized into
+SQLite and read back out. Recovery can only re-admit a step for a workflow
+the current process has already registered its bodies for. If the whole
+process (not just one worker) goes down before those bodies are registered
+again on restart, the persisted event log and step status are still there —
+but re-running the step needs your code to reconstruct the `Workflow` and
+hand its bodies to the engine again first.
+
+This is the same shape as V1's `Job`: agentq durability is about *state* —
+what happened, what's pending — not about persisting arbitrary Rust
+closures across a restart.
+
+## Event encoding
+
+Events are stored as a small hand-rolled, line-based encoding rather than
+through `serde` — this project has no serialization dependency, and nothing
+outside `SqliteStore` ever needs to parse the `events` table, so adding one
+for this alone wasn't worth it.

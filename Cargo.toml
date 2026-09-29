@@ -21,6 +21,9 @@ exclude = [
 [features]
 sqlite = ["dep:rusqlite"]
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
 strum = { version = "0.28.0", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["sync", "rt", "time"] }

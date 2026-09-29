@@ -211,7 +211,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
             .await
     }
 
-    /// Opaque input supplied by the most recent [`resume`] for this step, if any.
+    /// Opaque input supplied by the most recent [`Self::resume`] for this step, if any.
     pub fn resume_input(&self, workflow_id: &str, step_index: usize) -> Option<String> {
         self.resume_inputs
             .lock()

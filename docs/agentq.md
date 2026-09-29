@@ -74,6 +74,26 @@ on an external condition. The engine records [`Event`] values along the way so
 you can reconstruct what happened; workers learn whether they claimed a step
 through [`ClaimResult`].
 
+[`WorkflowEngine`] drives a [`Workflow`]'s steps through the same [`Queue`]
+V1 jobs use — it is the only thing that calls [`Queue::push`] for a workflow
+step. A failed step is retried per its [`RetryPolicy`] by the engine itself,
+not by `Queue`; `Queue` stays exactly as retry-agnostic as it is for plain
+jobs. A step blocked on something outside the process (approval, a webhook,
+a human) ends up [`StepStatus::Waiting`], and [`WorkflowEngine::resume`]
+unblocks it with whatever input arrived.
+
+Where a step's status and event history live is up to a [`DurableStore`]
+implementation, not the engine. [`SqliteStore`] ships as the one concrete
+implementation, behind the `sqlite` Cargo feature, storing an append-only
+event log alongside a queryable projection of each step's current status —
+so a consumer who only wants V1's `Queue` never pulls in `rusqlite`. If you
+need a different backend, implement [`DurableStore`] yourself; the engine
+doesn't know or care what's behind the trait.
+
+A worker that dies mid-step leaves its lease to expire; [`recover`] finds
+those expired leases via [`DurableStore::expired_leases`] and re-admits the
+steps, recording [`Event::WorkerRecovered`].
+
 # Sharing a queue
 
 [`Queue`] is cheap to clone and every clone refers to the same queue, so share
@@ -112,10 +132,12 @@ Keys and their cached outputs are retained for the life of the process, so a
 producer with unbounded distinct keys grows memory. Dropping the queue
 abandons in-flight work.
 
-agentq deliberately does not persist anything and does not coordinate across
-processes. Everything lives in your binary; if it dies, queued work dies with
-it. If you need durability or a shared queue across machines, you want a
-different tool.
+[`Queue`] itself deliberately does not persist anything and does not
+coordinate across processes. Everything lives in your binary; if it dies,
+queued work dies with it. If you need a job's state to survive a restart, use
+a [`Workflow`] with a [`DurableStore`] (see above) rather than the raw
+`Queue` — but agentq still does not coordinate across machines; if you need
+that, you want a different tool.
 
 # Upcoming
 
