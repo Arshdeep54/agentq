@@ -219,6 +219,68 @@ impl<S: DurableStore> WorkflowEngine<S> {
             .cloned()
     }
 
+    pub(crate) fn store(&self) -> &S {
+        &self.store
+    }
+
+    /// Registers step bodies so recovered steps can be re-admitted after a crash.
+    #[cfg(test)]
+    pub(crate) fn mount_workflow(
+        &self,
+        workflow: Workflow,
+        bodies: Vec<StepFunc>,
+    ) -> Result<(), EngineError> {
+        if bodies.len() != workflow.steps.len() {
+            return Err(EngineError::Store(StoreError::Backend(
+                "step body count does not match workflow definition".into(),
+            )));
+        }
+
+        let shared_bodies: Vec<SharedStepFunc> = bodies
+            .into_iter()
+            .map(|body| Arc::new(move || body()) as SharedStepFunc)
+            .collect();
+
+        self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            workflow.id.clone(),
+            RunningWorkflow {
+                steps: workflow.steps,
+                bodies: shared_bodies,
+            },
+        );
+        Ok(())
+    }
+
+    /// Clears an expired lease in the store and re-runs the step when bodies are mounted.
+    pub(crate) async fn readmit_after_worker_recovery(
+        &self,
+        workflow_id: &str,
+        step_index: usize,
+        attempt: u32,
+    ) -> Result<(), EngineError> {
+        self.store.append_event(&Event::WorkerRecovered {
+            workflow_id: workflow_id.to_string(),
+            step_index,
+        })?;
+
+        let (step, body) = {
+            let guard = self.in_flight.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(running) = guard.get(workflow_id) else {
+                return Ok(());
+            };
+            if step_index >= running.steps.len() {
+                return Ok(());
+            }
+            (
+                running.steps[step_index].clone(),
+                running.bodies[step_index].clone(),
+            )
+        };
+
+        self.run_step(workflow_id, step_index, &step, body, attempt)
+            .await
+    }
+
     async fn run_step(
         &self,
         workflow_id: &str,
@@ -417,6 +479,11 @@ fn step_status_from_events(events: &[Event], step_index: usize) -> StepStatus {
                 status = StepStatus::Pending;
             }
             Event::StepResumed {
+                step_index: si, ..
+            } if *si == step_index => {
+                status = StepStatus::Pending;
+            }
+            Event::WorkerRecovered {
                 step_index: si, ..
             } if *si == step_index => {
                 status = StepStatus::Pending;

@@ -151,7 +151,7 @@ impl DurableStore for SqliteStore {
         let conn = lock_conn(self)?;
         let mut stmt = conn
             .prepare(
-                "SELECT step_index, attempt, worker_id, expires_at_secs, expires_at_nanos
+                "SELECT workflow_id, step_index, attempt, worker_id, expires_at_secs, expires_at_nanos
                  FROM steps
                  WHERE status = 'leased'
                    AND worker_id IS NOT NULL
@@ -164,20 +164,28 @@ impl DurableStore for SqliteStore {
         let rows = stmt
             .query_map(params![now_secs, now_nanos], |row| {
                 Ok((
-                    row.get::<_, i64>(0)? as usize,
-                    row.get::<_, i64>(1)? as u32,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as u32,
+                    row.get::<_, String>(3)?,
                     row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(|e| StoreError::Backend(e.to_string()))?;
 
         let mut out = Vec::new();
         for row in rows {
-            let (step_index, attempt, worker_id, expires_at_secs, expires_at_nanos) =
-                row.map_err(|e| StoreError::Backend(e.to_string()))?;
+            let (
+                workflow_id,
+                step_index,
+                attempt,
+                worker_id,
+                expires_at_secs,
+                expires_at_nanos,
+            ) = row.map_err(|e| StoreError::Backend(e.to_string()))?;
             out.push(Execution {
+                workflow_id,
                 step_index,
                 attempt,
                 worker_id,

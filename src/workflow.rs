@@ -40,6 +40,7 @@ pub struct Workflow {
 
 #[derive(Debug, Clone)]
 pub struct Execution {
+    pub workflow_id: String,
     pub step_index: usize,
     pub attempt: u32,
     pub worker_id: String,
