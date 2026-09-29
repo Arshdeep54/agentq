@@ -62,6 +62,18 @@ returns `Result<String, Box<dyn Error + Send + Sync>>`. The `String` is cached
 against the key, so a later push of the same key gets that output back without
 re-executing.
 
+# Workflows
+
+A workflow is an ordered list of [`StepDef`] entries under a stable id. Each
+step carries a name for logging and UI, a [`RetryPolicy`] that caps attempts
+and chooses backoff, and an optional per-step timeout.
+
+While a workflow runs, every step is in some [`StepStatus`]: waiting to start,
+leased to a worker, completed with output, failed after an attempt, or blocked
+on an external condition. The engine records [`Event`] values along the way so
+you can reconstruct what happened; workers learn whether they claimed a step
+through [`ClaimResult`].
+
 # Sharing a queue
 
 [`Queue`] is cheap to clone and every clone refers to the same queue, so share

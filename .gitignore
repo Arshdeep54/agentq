@@ -3,3 +3,7 @@
 # Added by cargo
 
 /target
+
+# cursor-agent CLI permissions, /implement run state
+/.cursor
+/.implement
