@@ -207,15 +207,26 @@ impl<S: DurableStore> WorkflowEngine<S> {
 
         match self
             .run_step(workflow_id, step_index, &step, body, attempt)
-            .await?
+            .await
         {
-            StepOutcome::Waiting => Ok(()),
-            StepOutcome::Completed => {
+            Ok(StepOutcome::Waiting) => Ok(()),
+            Ok(StepOutcome::Completed) => {
                 let (steps, bodies) = self.mounted_steps_and_bodies(workflow_id)?;
                 self.drive_from(workflow_id, &steps, &bodies, step_index + 1)
                     .await
             }
+            Err(err) => {
+                self.drop_from_in_flight(workflow_id);
+                Err(err)
+            }
         }
+    }
+
+    fn drop_from_in_flight(&self, workflow_id: &str) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(workflow_id);
     }
 
     fn mounted_steps_and_bodies(
@@ -256,10 +267,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
                 Ok(StepOutcome::Completed) => continue,
                 Ok(StepOutcome::Waiting) => return Ok(()),
                 Err(err) => {
-                    self.in_flight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(workflow_id);
+                    self.drop_from_in_flight(workflow_id);
                     return Err(err);
                 }
             }
@@ -322,13 +330,17 @@ impl<S: DurableStore> WorkflowEngine<S> {
 
         match self
             .run_step(workflow_id, step_index, &step, body, attempt)
-            .await?
+            .await
         {
-            StepOutcome::Waiting => Ok(()),
-            StepOutcome::Completed => {
+            Ok(StepOutcome::Waiting) => Ok(()),
+            Ok(StepOutcome::Completed) => {
                 let (steps, bodies) = self.mounted_steps_and_bodies(workflow_id)?;
                 self.drive_from(workflow_id, &steps, &bodies, step_index + 1)
                     .await
+            }
+            Err(err) => {
+                self.drop_from_in_flight(workflow_id);
+                Err(err)
             }
         }
     }
@@ -774,5 +786,134 @@ mod tests {
         );
         let events = store.load_events("wf-wait").expect("load events");
         assert!(workflow_completed(&events));
+    }
+
+    #[tokio::test]
+    async fn resume_permanent_failure_unmounts_workflow() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let step_runs = Arc::new(AtomicUsize::new(0));
+        let step_runs_clone = step_runs.clone();
+        let step_attempts = AtomicUsize::new(0);
+
+        let step0: StepFunc = Box::new(move || {
+            step_runs_clone.fetch_add(1, Ordering::SeqCst);
+            let n = step_attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Err(Box::new(WaitForInput("need input".to_string()))
+                        as Box<dyn std::error::Error + Send + Sync>)
+                } else {
+                    Err("resume attempt failed".into())
+                }
+            })
+        });
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-resume-fail".to_string(),
+            steps: vec![StepDef {
+                name: "only".into(),
+                retry_policy: no_retry,
+                timeout: None,
+            }],
+        };
+
+        engine
+            .run(workflow, vec![step0])
+            .await
+            .expect("run should stop at waiting step");
+
+        assert_eq!(step_runs.load(Ordering::SeqCst), 1);
+
+        let err = engine
+            .resume("wf-resume-fail", 0, "input".to_string())
+            .await
+            .expect_err("resume should fail when retries are exhausted");
+        assert!(matches!(err, EngineError::WorkflowFailed { .. }));
+
+        assert_eq!(step_runs.load(Ordering::SeqCst), 2);
+
+        engine
+            .readmit_after_worker_recovery("wf-resume-fail", 0, 0)
+            .await
+            .expect("readmit on unmounted workflow is a no-op");
+
+        assert_eq!(
+            step_runs.load(Ordering::SeqCst),
+            2,
+            "step body must not run again after permanent failure dropped the mount"
+        );
+    }
+
+    #[tokio::test]
+    async fn readmit_permanent_failure_unmounts_workflow() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let step_runs = Arc::new(AtomicUsize::new(0));
+        let step_runs_clone = step_runs.clone();
+
+        let body: StepFunc = Box::new(move || {
+            step_runs_clone.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("always fails".into()) })
+        });
+
+        let workflow = Workflow {
+            id: "wf-readmit-fail".to_string(),
+            steps: vec![StepDef {
+                name: "only".into(),
+                retry_policy: RetryPolicy {
+                    max_attempts: 1,
+                    backoff: Backoff::Fixed(Duration::from_millis(1)),
+                },
+                timeout: None,
+            }],
+        };
+
+        engine
+            .register_workflow(workflow, vec![body])
+            .expect("register workflow");
+        store
+            .append_event(&Event::WorkflowStarted {
+                workflow_id: "wf-readmit-fail".to_string(),
+            })
+            .expect("workflow started");
+
+        let err = engine
+            .readmit_after_worker_recovery("wf-readmit-fail", 0, 0)
+            .await
+            .expect_err("readmit should fail when retries are exhausted");
+        assert!(matches!(err, EngineError::WorkflowFailed { .. }));
+        assert_eq!(step_runs.load(Ordering::SeqCst), 1);
+
+        engine
+            .readmit_after_worker_recovery("wf-readmit-fail", 0, 0)
+            .await
+            .expect("second readmit on unmounted workflow is a no-op");
+
+        assert_eq!(
+            step_runs.load(Ordering::SeqCst),
+            1,
+            "step body must not run again after permanent failure dropped the mount"
+        );
     }
 }
