@@ -783,6 +783,67 @@ mod tests {
         assert!(workflow_completed(&events));
     }
 
+    /// Two concurrent `run()` calls on a fresh workflow should execute the step
+    /// body once, coalesced by V1 job-key dedup at attempt 0.
+    ///
+    /// This does not prove that concurrent calls remain safe once one call chain
+    /// has retried a step and the other has not (diverging job keys).
+    #[tokio::test]
+    async fn concurrent_run_on_fresh_workflow_executes_step_once() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store,
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-concurrent-fresh".to_string(),
+            steps: vec![StepDef {
+                name: "only".into(),
+                retry_policy: no_retry,
+                timeout: None,
+            }],
+        };
+
+        let bodies_a: Vec<StepFunc> = {
+            let counter = counter.clone();
+            vec![Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok("done".to_string()) })
+            })]
+        };
+        let bodies_b: Vec<StepFunc> = {
+            let counter = counter.clone();
+            vec![Box::new(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok("done".to_string()) })
+            })]
+        };
+
+        let (result_a, result_b) = tokio::join!(
+            engine.run(workflow.clone(), bodies_a),
+            engine.run(workflow.clone(), bodies_b),
+        );
+
+        result_a.expect("first concurrent run should succeed");
+        result_b.expect("second concurrent run should succeed");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "job-key dedup should admit only one concurrent step execution"
+        );
+    }
+
     fn count_workflow_completed(events: &[Event]) -> usize {
         events
             .iter()
