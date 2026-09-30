@@ -40,6 +40,10 @@ pub enum Event {
         workflow_id: String,
         reason: String,
     },
+    WorkflowCancelled {
+        workflow_id: String,
+        reason: String,
+    },
     WorkerRecovered {
         workflow_id: String,
         step_index: usize,

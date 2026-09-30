@@ -209,6 +209,7 @@ mod tests {
             Event::StepResumed { workflow_id, .. } => workflow_id,
             Event::WorkflowCompleted { workflow_id } => workflow_id,
             Event::WorkflowFailed { workflow_id, .. } => workflow_id,
+            Event::WorkflowCancelled { workflow_id, .. } => workflow_id,
             Event::WorkerRecovered { workflow_id, .. } => workflow_id,
         }
     }

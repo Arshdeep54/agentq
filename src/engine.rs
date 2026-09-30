@@ -188,6 +188,37 @@ impl<S: DurableStore> WorkflowEngine<S> {
     /// Unblocks a step in [`StepStatus::Waiting`], supplying opaque `input`
     /// for its next run, then continues driving the remaining steps in
     /// order — stopping again if a later step also enters `Waiting`.
+    /// Records [`Event::WorkflowCancelled`] and un-registers the workflow so the
+    /// engine will not claim or schedule further steps.
+    ///
+    /// Idempotent: if the workflow already has a terminal event
+    /// ([`Event::WorkflowCompleted`], [`Event::WorkflowFailed`], or
+    /// [`Event::WorkflowCancelled`]), returns `Ok(())` without appending
+    /// anything.
+    ///
+    /// Cancellation does not abort a step attempt already pushed to the V1
+    /// [`Queue`] and executing in a worker — V1 has no in-flight abort. Side
+    /// effects from that run may still occur. While driving steps, cancellation
+    /// is observed at the next step boundary (and between retry attempts for
+    /// the current step); a body already running on the queue is not stopped.
+    pub async fn cancel(&self, workflow_id: &str, reason: String) -> Result<(), EngineError> {
+        let events = self.store.load_events(workflow_id)?;
+        if workflow_has_terminal_event(&events) {
+            return Ok(());
+        }
+
+        self.store.append_event(&Event::WorkflowCancelled {
+            workflow_id: workflow_id.to_string(),
+            reason,
+        })?;
+
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(workflow_id);
+        Ok(())
+    }
+
     pub async fn resume(
         &self,
         workflow_id: &str,
@@ -195,6 +226,11 @@ impl<S: DurableStore> WorkflowEngine<S> {
         input: String,
     ) -> Result<(), EngineError> {
         let events = self.store.load_events(workflow_id)?;
+        if workflow_is_cancelled(&events) {
+            return Err(EngineError::Store(StoreError::Backend(
+                "workflow is cancelled".into(),
+            )));
+        }
         let status = step_status_from_events(&events, step_index);
         match status {
             StepStatus::Waiting { .. } => {}
@@ -266,6 +302,11 @@ impl<S: DurableStore> WorkflowEngine<S> {
         start_index: usize,
     ) -> Result<(), EngineError> {
         for step_index in start_index..steps.len() {
+            let events = self.store.load_events(workflow_id)?;
+            if workflow_is_cancelled(&events) {
+                return Ok(());
+            }
+
             match self
                 .run_step(
                     workflow_id,
@@ -489,6 +530,9 @@ impl<S: DurableStore> WorkflowEngine<S> {
                         })?;
                         let delay = backoff_duration(&step.retry_policy, attempt);
                         tokio::time::sleep(delay).await;
+                        if workflow_is_cancelled(&self.store.load_events(workflow_id)?) {
+                            return Ok(StepOutcome::Waiting);
+                        }
                         attempt = next_attempt;
                         continue;
                     }
@@ -502,6 +546,23 @@ impl<S: DurableStore> WorkflowEngine<S> {
             }
         }
     }
+}
+
+fn workflow_has_terminal_event(events: &[Event]) -> bool {
+    events.iter().any(|e| {
+        matches!(
+            e,
+            Event::WorkflowCompleted { .. }
+                | Event::WorkflowFailed { .. }
+                | Event::WorkflowCancelled { .. }
+        )
+    })
+}
+
+fn workflow_is_cancelled(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|e| matches!(e, Event::WorkflowCancelled { .. }))
 }
 
 fn backoff_duration(policy: &RetryPolicy, failed_attempt: u32) -> Duration {
@@ -676,6 +737,7 @@ mod tests {
             Event::StepResumed { workflow_id, .. } => workflow_id,
             Event::WorkflowCompleted { workflow_id } => workflow_id,
             Event::WorkflowFailed { workflow_id, .. } => workflow_id,
+            Event::WorkflowCancelled { workflow_id, .. } => workflow_id,
             Event::WorkerRecovered { workflow_id, .. } => workflow_id,
         }
     }
@@ -1063,6 +1125,13 @@ mod tests {
             .count()
     }
 
+    fn count_workflow_cancelled(events: &[Event]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::WorkflowCancelled { .. }))
+            .count()
+    }
+
     #[cfg(feature = "sqlite")]
     fn sqlite_engine(store: crate::SqliteStore) -> WorkflowEngine<crate::SqliteStore> {
         WorkflowEngine::new(
@@ -1217,6 +1286,273 @@ mod tests {
             .store()
             .load_events("wf-once-complete")
             .expect("load events");
+        assert_eq!(count_workflow_completed(&events), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_never_run_workflow_appends_one_cancelled_event() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-cancel-fresh".to_string(),
+            steps: vec![StepDef {
+                name: "only".into(),
+                retry_policy: no_retry,
+                timeout: None,
+            }],
+        };
+
+        engine
+            .register_workflow(
+                workflow,
+                vec![Box::new(|| Box::pin(async { Ok("x".into()) }))],
+            )
+            .expect("register");
+
+        engine
+            .cancel("wf-cancel-fresh", "user requested".to_string())
+            .await
+            .expect("cancel");
+
+        let events = store.load_events("wf-cancel-fresh").expect("load");
+        assert_eq!(count_workflow_cancelled(&events), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_between_steps_stops_before_next_step_and_no_completion() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let step1_ran = Arc::new(AtomicUsize::new(0));
+        let step1_ran_clone = step1_ran.clone();
+        let step0_done = Arc::new(tokio::sync::Notify::new());
+        let step0_done_clone = step0_done.clone();
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-cancel-mid".to_string(),
+            steps: vec![
+                StepDef {
+                    name: "first".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "second".into(),
+                    retry_policy: no_retry,
+                    timeout: None,
+                },
+            ],
+        };
+
+        let step0: StepFunc = Box::new(move || {
+            let notify = step0_done_clone.clone();
+            Box::pin(async move {
+                notify.notify_one();
+                tokio::task::yield_now().await;
+                Ok("first".to_string())
+            })
+        });
+        let step1: StepFunc = Box::new(move || {
+            let counter = step1_ran_clone.clone();
+            Box::pin(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok("second".to_string())
+            })
+        });
+
+        let engine = Arc::new(engine);
+        let run_engine = engine.clone();
+        let run_handle = tokio::spawn(async move {
+            run_engine
+                .run(workflow, vec![step0, step1])
+                .await
+                .expect("run");
+        });
+
+        step0_done.notified().await;
+        engine
+            .cancel("wf-cancel-mid", "stop".to_string())
+            .await
+            .expect("cancel");
+        run_handle.await.expect("run task");
+
+        assert_eq!(
+            step1_ran.load(Ordering::SeqCst),
+            0,
+            "step after cancellation must not run"
+        );
+        let events = store.load_events("wf-cancel-mid").expect("load events");
+        assert_eq!(count_workflow_cancelled(&events), 1);
+        assert_eq!(count_workflow_completed(&events), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_while_waiting_blocks_resume() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-cancel-wait".to_string(),
+            steps: vec![
+                StepDef {
+                    name: "first".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "approval".into(),
+                    retry_policy: no_retry,
+                    timeout: None,
+                },
+            ],
+        };
+
+        let step0: StepFunc = Box::new(|| Box::pin(async { Ok("first".to_string()) }));
+        let step1: StepFunc = Box::new(|| {
+            Box::pin(async {
+                Err(Box::new(WaitForInput("need approval".to_string()))
+                    as Box<dyn std::error::Error + Send + Sync>)
+            })
+        });
+
+        engine
+            .run(workflow, vec![step0, step1])
+            .await
+            .expect("run pauses at waiting");
+
+        engine
+            .cancel("wf-cancel-wait", "no longer needed".to_string())
+            .await
+            .expect("cancel");
+
+        let result = engine
+            .resume("wf-cancel-wait", 1, "too late".to_string())
+            .await;
+        assert!(
+            matches!(result, Err(EngineError::Store(StoreError::Backend(_)))),
+            "resume on cancelled workflow should error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_twice_appends_one_cancelled_event() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-cancel-twice".to_string(),
+            steps: vec![StepDef {
+                name: "only".into(),
+                retry_policy: no_retry,
+                timeout: None,
+            }],
+        };
+
+        engine
+            .register_workflow(
+                workflow,
+                vec![Box::new(|| Box::pin(async { Ok("x".into()) }))],
+            )
+            .expect("register");
+
+        engine
+            .cancel("wf-cancel-twice", "once".to_string())
+            .await
+            .expect("first cancel");
+        engine
+            .cancel("wf-cancel-twice", "again".to_string())
+            .await
+            .expect("second cancel");
+
+        let events = store.load_events("wf-cancel-twice").expect("load");
+        assert_eq!(count_workflow_cancelled(&events), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_completed_workflow_does_not_add_cancelled_event() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-cancel-done".to_string(),
+            steps: vec![StepDef {
+                name: "only".into(),
+                retry_policy: no_retry,
+                timeout: None,
+            }],
+        };
+
+        engine
+            .run(
+                workflow,
+                vec![Box::new(|| Box::pin(async { Ok("done".to_string()) }))],
+            )
+            .await
+            .expect("run completes");
+
+        engine
+            .cancel("wf-cancel-done", "too late".to_string())
+            .await
+            .expect("cancel is no-op");
+
+        let events = store.load_events("wf-cancel-done").expect("load");
+        assert_eq!(count_workflow_cancelled(&events), 0);
         assert_eq!(count_workflow_completed(&events), 1);
     }
 }

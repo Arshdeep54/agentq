@@ -399,7 +399,9 @@ fn apply_event_projection(tx: &Transaction, event: &Event) -> Result<(), rusqlit
                 Some(attempt),
             )
         }
-        Event::WorkflowCompleted { .. } | Event::WorkflowFailed { .. } => Ok(()),
+        Event::WorkflowCompleted { .. }
+        | Event::WorkflowFailed { .. }
+        | Event::WorkflowCancelled { .. } => Ok(()),
     }
 }
 
@@ -472,6 +474,7 @@ fn event_workflow_id(event: &Event) -> &str {
         Event::StepResumed { workflow_id, .. } => workflow_id,
         Event::WorkflowCompleted { workflow_id } => workflow_id,
         Event::WorkflowFailed { workflow_id, .. } => workflow_id,
+        Event::WorkflowCancelled { workflow_id, .. } => workflow_id,
         Event::WorkerRecovered { workflow_id, .. } => workflow_id,
     }
 }
@@ -550,6 +553,14 @@ fn encode_event(event: &Event) -> String {
             reason,
         } => {
             lines.push("WorkflowFailed".to_string());
+            lines.push(escape_field(workflow_id));
+            lines.push(escape_field(reason));
+        }
+        Event::WorkflowCancelled {
+            workflow_id,
+            reason,
+        } => {
+            lines.push("WorkflowCancelled".to_string());
             lines.push(escape_field(workflow_id));
             lines.push(escape_field(reason));
         }
@@ -641,6 +652,14 @@ fn decode_event(payload: &str) -> Result<Event, StoreError> {
             let workflow_id = read_field(&mut lines)?;
             let reason = read_field(&mut lines)?;
             Ok(Event::WorkflowFailed {
+                workflow_id,
+                reason,
+            })
+        }
+        "WorkflowCancelled" => {
+            let workflow_id = read_field(&mut lines)?;
+            let reason = read_field(&mut lines)?;
+            Ok(Event::WorkflowCancelled {
                 workflow_id,
                 reason,
             })
