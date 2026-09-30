@@ -12,7 +12,7 @@ mod store;
 mod worker;
 mod workflow;
 
-pub use crate::engine::{EngineError, WaitForInput, WorkflowEngine};
+pub use crate::engine::{EngineError, NonRetryable, WaitForInput, WorkflowEngine};
 pub use crate::error::{JobLost, PushError, WaitError};
 pub use crate::event::{ClaimResult, Event};
 pub use crate::handle::{JobHandle, Outcome};

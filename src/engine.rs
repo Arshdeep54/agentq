@@ -34,6 +34,29 @@ fn parse_waiting_reason(reason: &str) -> Option<&str> {
     reason.strip_prefix(WAIT_PREFIX)
 }
 
+/// Marker error returned from a step body to fail the workflow without retrying.
+///
+/// The worker turns this into a failed [`Outcome`]; the engine recognizes the
+/// encoding and records [`Event::WorkflowFailed`] immediately, skipping
+/// [`Event::RetryScheduled`] even when [`RetryPolicy::max_attempts`] would
+/// allow more tries.
+#[derive(Debug)]
+pub struct NonRetryable(pub String);
+
+impl std::fmt::Display for NonRetryable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{NON_RETRYABLE_PREFIX}{}", self.0)
+    }
+}
+
+impl std::error::Error for NonRetryable {}
+
+const NON_RETRYABLE_PREFIX: &str = "agentq:non-retryable:";
+
+fn parse_non_retryable_reason(reason: &str) -> Option<&str> {
+    reason.strip_prefix(NON_RETRYABLE_PREFIX)
+}
+
 /// Drives workflow steps through the V1 [`Queue`] and records V2 [`Event`]s.
 pub struct WorkflowEngine<S: DurableStore> {
     queue: Queue,
@@ -438,6 +461,19 @@ impl<S: DurableStore> WorkflowEngine<S> {
                         return Ok(StepOutcome::Waiting);
                     }
 
+                    if parse_non_retryable_reason(&reason).is_some() {
+                        self.store.append_event(&Event::StepFailed {
+                            workflow_id: workflow_id.to_string(),
+                            step_index,
+                            reason: reason.clone(),
+                        })?;
+                        self.store.append_event(&Event::WorkflowFailed {
+                            workflow_id: workflow_id.to_string(),
+                            reason: reason.clone(),
+                        })?;
+                        return Err(EngineError::WorkflowFailed { reason });
+                    }
+
                     self.store.append_event(&Event::StepFailed {
                         workflow_id: workflow_id.to_string(),
                         step_index,
@@ -714,6 +750,57 @@ mod tests {
         assert!(matches!(lifecycle[0], Event::StepFailed { .. }));
         assert!(matches!(lifecycle[1], Event::RetryScheduled { .. }));
         assert!(matches!(lifecycle[2], Event::StepCompleted { .. }));
+    }
+
+    #[tokio::test]
+    async fn non_retryable_failure_fails_workflow_without_scheduling_retry() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let body: StepFunc = Box::new(|| {
+            Box::pin(async {
+                Err(Box::new(NonRetryable("bad request".to_string()))
+                    as Box<dyn std::error::Error + Send + Sync>)
+            })
+        });
+
+        let workflow = Workflow {
+            id: "wf-non-retryable".to_string(),
+            steps: vec![StepDef {
+                name: "only".to_string(),
+                retry_policy: RetryPolicy {
+                    max_attempts: 5,
+                    backoff: Backoff::Fixed(Duration::from_millis(1)),
+                },
+                timeout: None,
+            }],
+        };
+
+        let result = engine.run(workflow, vec![body]).await;
+        assert!(
+            matches!(result, Err(EngineError::WorkflowFailed { .. })),
+            "non-retryable step failure should fail the workflow"
+        );
+
+        let events = store.load_events("wf-non-retryable").expect("load events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::WorkflowFailed { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::RetryScheduled { .. })),
+            "non-retryable failure must not schedule a retry"
+        );
     }
 
     #[tokio::test]
