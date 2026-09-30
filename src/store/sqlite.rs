@@ -1,10 +1,10 @@
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use crate::{ClaimResult, Event, Execution};
 use crate::store::{DurableStore, StoreError};
+use crate::{ClaimResult, Event, Execution};
 
 /// SQLite-backed [`DurableStore`] with an append-only event log and a `steps` projection.
 pub struct SqliteStore {
@@ -66,8 +66,7 @@ impl DurableStore for SqliteStore {
         )
         .map_err(|e| StoreError::Backend(e.to_string()))?;
         apply_event_projection(&tx, event).map_err(|e| StoreError::Backend(e.to_string()))?;
-        tx.commit()
-            .map_err(|e| StoreError::Backend(e.to_string()))
+        tx.commit().map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     fn load_events(&self, workflow_id: &str) -> Result<Vec<Event>, StoreError> {
@@ -121,9 +120,7 @@ impl DurableStore for SqliteStore {
             return Err(StoreError::NotFound);
         };
         if row.status != "leased" || row.worker_id.as_deref() != Some(worker_id) {
-            return Err(StoreError::Backend(
-                "lease not held by worker".to_string(),
-            ));
+            return Err(StoreError::Backend("lease not held by worker".to_string()));
         }
         let (secs, nanos) = system_time_parts(
             SystemTime::now()
@@ -138,12 +135,9 @@ impl DurableStore for SqliteStore {
             )
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         if updated == 0 {
-            return Err(StoreError::Backend(
-                "lease not held by worker".to_string(),
-            ));
+            return Err(StoreError::Backend("lease not held by worker".to_string()));
         }
-        tx.commit()
-            .map_err(|e| StoreError::Backend(e.to_string()))
+        tx.commit().map_err(|e| StoreError::Backend(e.to_string()))
     }
 
     fn expired_leases(&self) -> Result<Vec<Execution>, StoreError> {
@@ -176,14 +170,8 @@ impl DurableStore for SqliteStore {
 
         let mut out = Vec::new();
         for row in rows {
-            let (
-                workflow_id,
-                step_index,
-                attempt,
-                worker_id,
-                expires_at_secs,
-                expires_at_nanos,
-            ) = row.map_err(|e| StoreError::Backend(e.to_string()))?;
+            let (workflow_id, step_index, attempt, worker_id, expires_at_secs, expires_at_nanos) =
+                row.map_err(|e| StoreError::Backend(e.to_string()))?;
             out.push(Execution {
                 workflow_id,
                 step_index,
@@ -227,8 +215,7 @@ fn claim_step_tx(
                 row.expires_at_secs,
                 row.expires_at_nanos,
             ) {
-                let expires_at =
-                    system_time_from_parts_rusqlite(Some(exp_secs), Some(exp_nanos))?;
+                let expires_at = system_time_from_parts_rusqlite(Some(exp_secs), Some(exp_nanos))?;
                 if holder != worker_id && expires_at > now {
                     return Ok(ClaimResult::HeldByOther);
                 }
@@ -294,20 +281,18 @@ fn apply_event_projection(tx: &Transaction, event: &Event) -> Result<(), rusqlit
             workflow_id,
             step_index,
             attempt,
-        } => {
-            upsert_step_status(
-                tx,
-                workflow_id,
-                *step_index,
-                "pending",
-                None,
-                None,
-                None,
-                None,
-                None,
-                Some(*attempt as i64),
-            )
-        }
+        } => upsert_step_status(
+            tx,
+            workflow_id,
+            *step_index,
+            "pending",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(*attempt as i64),
+        ),
         Event::StepCompleted {
             workflow_id,
             step_index,
@@ -579,7 +564,9 @@ fn encode_event(event: &Event) -> String {
 
 fn decode_event(payload: &str) -> Result<Event, StoreError> {
     let mut lines = payload.split('\n');
-    let kind = lines.next().ok_or_else(|| StoreError::Backend("empty event payload".into()))?;
+    let kind = lines
+        .next()
+        .ok_or_else(|| StoreError::Backend("empty event payload".into()))?;
     match kind {
         "WorkflowStarted" => {
             let workflow_id = read_field(&mut lines)?;
@@ -773,13 +760,9 @@ mod tests {
         let store = SqliteStore::new(":memory:").expect("open db");
         let wf = "wf-claim";
         let ttl = Duration::from_secs(300);
-        let first = store
-            .claim_step(wf, 0, "worker-a", ttl)
-            .expect("claim");
+        let first = store.claim_step(wf, 0, "worker-a", ttl).expect("claim");
         assert!(matches!(first, ClaimResult::Claimed));
-        let second = store
-            .claim_step(wf, 0, "worker-b", ttl)
-            .expect("claim");
+        let second = store.claim_step(wf, 0, "worker-b", ttl).expect("claim");
         assert!(matches!(second, ClaimResult::HeldByOther));
     }
 }

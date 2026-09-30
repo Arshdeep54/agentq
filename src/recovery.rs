@@ -6,11 +6,7 @@ pub async fn recover<S: DurableStore>(engine: &WorkflowEngine<S>) -> Result<usiz
     let mut recovered = 0usize;
     for exec in expired {
         engine
-            .readmit_after_worker_recovery(
-                &exec.workflow_id,
-                exec.step_index,
-                exec.attempt,
-            )
+            .readmit_after_worker_recovery(&exec.workflow_id, exec.step_index, exec.attempt)
             .await?;
         recovered += 1;
     }
@@ -94,7 +90,9 @@ mod tests {
                         row.status = StepStatus::Pending;
                     }
                 }
-                Event::StepCompleted { step_index, output, .. } => {
+                Event::StepCompleted {
+                    step_index, output, ..
+                } => {
                     steps.insert(
                         (workflow_id, *step_index),
                         StepProjection {
@@ -227,9 +225,7 @@ mod tests {
             Priority::High,
         );
 
-        let body: StepFunc = Box::new(|| {
-            Box::pin(async { Ok("done".to_string()) })
-        });
+        let body: StepFunc = Box::new(|| Box::pin(async { Ok("done".to_string()) }));
         let workflow = Workflow {
             id: workflow_id.to_string(),
             steps: vec![StepDef {
@@ -248,9 +244,7 @@ mod tests {
         let count = recover(&engine).await.expect("recover");
         assert_eq!(count, 1);
 
-        let status = store
-            .step_status(workflow_id, 0)
-            .expect("step row exists");
+        let status = store.step_status(workflow_id, 0).expect("step row exists");
         assert!(!matches!(
             status,
             StepStatus::Leased {
@@ -298,8 +292,16 @@ mod tests {
         let workflow = Workflow {
             id: workflow_id.to_string(),
             steps: vec![
-                StepDef { name: "first".into(), retry_policy: no_retry.clone(), timeout: None },
-                StepDef { name: "second".into(), retry_policy: no_retry, timeout: None },
+                StepDef {
+                    name: "first".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "second".into(),
+                    retry_policy: no_retry,
+                    timeout: None,
+                },
             ],
         };
         engine

@@ -1,7 +1,9 @@
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Event {
-    WorkflowStarted { workflow_id: String },
+    WorkflowStarted {
+        workflow_id: String,
+    },
     StepStarted {
         workflow_id: String,
         step_index: usize,
@@ -31,7 +33,9 @@ pub enum Event {
         workflow_id: String,
         step_index: usize,
     },
-    WorkflowCompleted { workflow_id: String },
+    WorkflowCompleted {
+        workflow_id: String,
+    },
     WorkflowFailed {
         workflow_id: String,
         reason: String,

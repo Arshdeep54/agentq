@@ -12,9 +12,16 @@ pub enum StepStatus {
         worker_id: String,
         expires_at: std::time::SystemTime,
     },
-    Completed { output: String },
-    Failed { reason: String, attempt: u32 },
-    Waiting { reason: String },
+    Completed {
+        output: String,
+    },
+    Failed {
+        reason: String,
+        attempt: u32,
+    },
+    Waiting {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -49,4 +56,8 @@ pub struct Execution {
 
 /// A step's body. `Fn`, not `FnOnce` like `Job`'s `Func` — the engine may
 /// call this again across retry attempts, so it can't be consumed on first run.
-pub type StepFunc = Box<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::JobResult> + Send>> + Send + Sync>;
+pub type StepFunc = Box<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::JobResult> + Send>>
+        + Send
+        + Sync,
+>;

@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{
-    Accepted, ClaimResult, DurableStore, Event, Job, JobLost, JobResult, Outcome, Priority, PushError,
-    Queue, RetryPolicy, StepDef, StepFunc, StepStatus, StoreError, Workflow,
+    Accepted, ClaimResult, DurableStore, Event, Job, JobLost, JobResult, Outcome, Priority,
+    PushError, Queue, RetryPolicy, StepDef, StepFunc, StepStatus, StoreError, Workflow,
 };
 
 type SharedStepFunc =
@@ -131,13 +131,16 @@ impl<S: DurableStore> WorkflowEngine<S> {
             .map(|body| Arc::from(body) as SharedStepFunc)
             .collect();
 
-        self.in_flight.lock().unwrap_or_else(|e| e.into_inner()).insert(
-            workflow.id.clone(),
-            RunningWorkflow {
-                steps: workflow.steps,
-                bodies: shared_bodies,
-            },
-        );
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                workflow.id.clone(),
+                RunningWorkflow {
+                    steps: workflow.steps,
+                    bodies: shared_bodies,
+                },
+            );
         Ok(())
     }
 
@@ -241,7 +244,13 @@ impl<S: DurableStore> WorkflowEngine<S> {
     ) -> Result<(), EngineError> {
         for step_index in start_index..steps.len() {
             match self
-                .run_step(workflow_id, step_index, &steps[step_index], bodies[step_index].clone(), 0)
+                .run_step(
+                    workflow_id,
+                    step_index,
+                    &steps[step_index],
+                    bodies[step_index].clone(),
+                    0,
+                )
                 .await
             {
                 Ok(StepOutcome::Completed) => continue,
@@ -337,12 +346,8 @@ impl<S: DurableStore> WorkflowEngine<S> {
         loop {
             match self
                 .store
-                .claim_step(
-                    workflow_id,
-                    step_index,
-                    &self.worker_id,
-                    self.lease_ttl,
-                )? {
+                .claim_step(workflow_id, step_index, &self.worker_id, self.lease_ttl)?
+            {
                 ClaimResult::AlreadyCompleted { .. } => return Ok(StepOutcome::Completed),
                 ClaimResult::HeldByOther => {
                     return Err(EngineError::Store(StoreError::Backend(
@@ -360,11 +365,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
 
             let key = format!("{workflow_id}:{step_index}:{attempt}");
             let func = body.clone();
-            let job = Job::new(
-                key,
-                self.priority,
-                Box::new(move || func()),
-            );
+            let job = Job::new(key, self.priority, Box::new(move || func()));
 
             let handle = match self.queue.push(job).await {
                 Ok(accepted) => match accepted {
@@ -521,14 +522,10 @@ fn step_status_from_events(events: &[Event], step_index: usize) -> StepStatus {
                 attempt = *a;
                 status = StepStatus::Pending;
             }
-            Event::StepResumed {
-                step_index: si, ..
-            } if *si == step_index => {
+            Event::StepResumed { step_index: si, .. } if *si == step_index => {
                 status = StepStatus::Pending;
             }
-            Event::WorkerRecovered {
-                step_index: si, ..
-            } if *si == step_index => {
+            Event::WorkerRecovered { step_index: si, .. } if *si == step_index => {
                 status = StepStatus::Pending;
             }
             _ => {}
@@ -729,9 +726,21 @@ mod tests {
         let workflow = Workflow {
             id: "wf-wait".to_string(),
             steps: vec![
-                StepDef { name: "first".into(), retry_policy: no_retry.clone(), timeout: None },
-                StepDef { name: "approval".into(), retry_policy: no_retry.clone(), timeout: None },
-                StepDef { name: "last".into(), retry_policy: no_retry, timeout: None },
+                StepDef {
+                    name: "first".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "approval".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "last".into(),
+                    retry_policy: no_retry,
+                    timeout: None,
+                },
             ],
         };
 

@@ -20,9 +20,9 @@ pub use crate::job::{Func, Job, JobResult, Key, Priority};
 pub use crate::queue::{Accepted, LaneConfig, Queue, QueueBuilder};
 pub use crate::recovery::recover;
 pub use crate::state::State;
-pub use crate::store::{DurableStore, StoreError};
 #[cfg(feature = "sqlite")]
 pub use crate::store::SqliteStore;
+pub use crate::store::{DurableStore, StoreError};
 pub use crate::workflow::{
     Backoff, Execution, RetryPolicy, StepDef, StepFunc, StepStatus, Workflow,
 };
