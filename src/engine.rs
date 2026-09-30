@@ -339,6 +339,21 @@ impl<S: DurableStore> WorkflowEngine<S> {
         }
     }
 
+    /// Runs one step attempt loop: claim, push to the queue, await the job, record
+    /// outcome, and retry per [`StepDef::retry_policy`] until success or exhaustion.
+    ///
+    /// When [`StepDef::timeout`] is set, the wait budget starts after the job is
+    /// pushed and its handle is obtained (not while claiming). The engine races that
+    /// handle against the timeout; if the timeout wins, it treats the attempt as
+    /// [`Outcome::Failed`] like any other failure.
+    ///
+    /// Step bodies run on a separate `tokio` task in the worker. Dropping the
+    /// [`JobHandle`] after a timeout does not cancel that task — the original body
+    /// keeps running to completion in the background. Its eventual outcome is written
+    /// into V1 state under the timed-out attempt's job key, but nothing durable
+    /// reads it once the engine retries under a new key. A timeout can therefore
+    /// leave an orphaned execution whose side effects still occur with no event
+    /// recorded for that run.
     async fn run_step(
         &self,
         workflow_id: &str,
@@ -389,9 +404,19 @@ impl<S: DurableStore> WorkflowEngine<S> {
                 Err(err) => return Err(EngineError::Push(err)),
             };
 
-            let outcome = match handle.await {
-                Ok(outcome) => outcome,
-                Err(err) => return Err(EngineError::JobLost(err)),
+            let outcome = if let Some(step_timeout) = step.timeout {
+                match tokio::time::timeout(step_timeout, handle).await {
+                    Ok(Ok(outcome)) => outcome,
+                    Ok(Err(err)) => return Err(EngineError::JobLost(err)),
+                    Err(_) => Outcome::Failed {
+                        reason: format!("step timed out after {:?}", step_timeout),
+                    },
+                }
+            } else {
+                match handle.await {
+                    Ok(outcome) => outcome,
+                    Err(err) => return Err(EngineError::JobLost(err)),
+                }
             };
 
             match outcome {
@@ -682,6 +707,106 @@ mod tests {
             .expect("workflow should complete");
 
         let events = store.load_events("wf-retry").expect("load events");
+        assert!(workflow_completed(&events));
+
+        let lifecycle = filter_step_lifecycle(&events);
+        assert_eq!(lifecycle.len(), 3);
+        assert!(matches!(lifecycle[0], Event::StepFailed { .. }));
+        assert!(matches!(lifecycle[1], Event::RetryScheduled { .. }));
+        assert!(matches!(lifecycle[2], Event::StepCompleted { .. }));
+    }
+
+    #[tokio::test]
+    async fn step_timeout_retries_then_workflow_fails_when_attempts_exhausted() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let body: StepFunc = Box::new(|| Box::pin(std::future::pending()));
+
+        let workflow = Workflow {
+            id: "wf-timeout-fail".to_string(),
+            steps: vec![StepDef {
+                name: "hang".to_string(),
+                retry_policy: RetryPolicy {
+                    max_attempts: 2,
+                    backoff: Backoff::Fixed(Duration::from_millis(1)),
+                },
+                timeout: Some(Duration::from_millis(20)),
+            }],
+        };
+
+        let result = engine.run(workflow, vec![body]).await;
+        assert!(
+            matches!(result, Err(EngineError::WorkflowFailed { .. })),
+            "expected workflow failure after timeouts exhaust retries"
+        );
+
+        let events = store.load_events("wf-timeout-fail").expect("load events");
+        assert!(!workflow_completed(&events));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::WorkflowFailed { .. }))
+        );
+
+        let retry_count = events
+            .iter()
+            .filter(|e| matches!(e, Event::RetryScheduled { .. }))
+            .count();
+        assert_eq!(retry_count, 1, "one retry between two timed-out attempts");
+    }
+
+    #[tokio::test]
+    async fn step_timeout_on_first_attempt_then_succeeds_on_retry() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let attempts = AtomicUsize::new(0);
+        let body: StepFunc = Box::new(move || {
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    std::future::pending::<JobResult>().await
+                } else {
+                    Ok("ok".to_string())
+                }
+            })
+        });
+
+        let workflow = Workflow {
+            id: "wf-timeout-retry-ok".to_string(),
+            steps: vec![StepDef {
+                name: "recover".to_string(),
+                retry_policy: RetryPolicy {
+                    max_attempts: 2,
+                    backoff: Backoff::Fixed(Duration::from_millis(1)),
+                },
+                timeout: Some(Duration::from_millis(20)),
+            }],
+        };
+
+        engine
+            .run(workflow, vec![body])
+            .await
+            .expect("workflow should complete after retry succeeds");
+
+        let events = store
+            .load_events("wf-timeout-retry-ok")
+            .expect("load events");
         assert!(workflow_completed(&events));
 
         let lifecycle = filter_step_lifecycle(&events);
