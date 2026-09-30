@@ -266,13 +266,17 @@ impl<S: DurableStore> WorkflowEngine<S> {
 
         match self
             .run_step(workflow_id, step_index, &step, body, attempt)
-            .await?
+            .await
         {
-            StepOutcome::Waiting => Ok(()),
-            StepOutcome::Completed => {
+            Ok(StepOutcome::Waiting) => Ok(()),
+            Ok(StepOutcome::Completed) => {
                 let (steps, bodies) = self.mounted_steps_and_bodies(workflow_id)?;
                 self.drive_from(workflow_id, &steps, &bodies, step_index + 1)
                     .await
+            }
+            Err(err) => {
+                self.drop_from_in_flight(workflow_id);
+                Err(err)
             }
         }
     }
@@ -286,6 +290,13 @@ impl<S: DurableStore> WorkflowEngine<S> {
             .get(workflow_id)
             .ok_or(EngineError::Store(StoreError::NotFound))?;
         Ok((running.steps.clone(), running.bodies.clone()))
+    }
+
+    fn drop_from_in_flight(&self, workflow_id: &str) {
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(workflow_id);
     }
 
     /// Runs steps `start_index..` in order. Returns `Ok(())` whether the
@@ -320,10 +331,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
                 Ok(StepOutcome::Completed) => continue,
                 Ok(StepOutcome::Waiting) => return Ok(()),
                 Err(err) => {
-                    self.in_flight
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .remove(workflow_id);
+                    self.drop_from_in_flight(workflow_id);
                     return Err(err);
                 }
             }
@@ -392,13 +400,17 @@ impl<S: DurableStore> WorkflowEngine<S> {
 
         match self
             .run_step(workflow_id, step_index, &step, body, attempt)
-            .await?
+            .await
         {
-            StepOutcome::Waiting => Ok(()),
-            StepOutcome::Completed => {
+            Ok(StepOutcome::Waiting) => Ok(()),
+            Ok(StepOutcome::Completed) => {
                 let (steps, bodies) = self.mounted_steps_and_bodies(workflow_id)?;
                 self.drive_from(workflow_id, &steps, &bodies, step_index + 1)
                     .await
+            }
+            Err(err) => {
+                self.drop_from_in_flight(workflow_id);
+                Err(err)
             }
         }
     }
@@ -1554,5 +1566,76 @@ mod tests {
         let events = store.load_events("wf-cancel-done").expect("load");
         assert_eq!(count_workflow_cancelled(&events), 0);
         assert_eq!(count_workflow_completed(&events), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_failure_cleans_up_in_flight_workflow() {
+        struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+
+        let attempts = AtomicUsize::new(0);
+        let body: StepFunc = Box::new(move || {
+            let _keep_alive = &guard;
+            let n = attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Err(Box::new(WaitForInput("needs approval".to_string()))
+                        as Box<dyn std::error::Error + Send + Sync>)
+                } else {
+                    Err("boom".into())
+                }
+            })
+        });
+
+        let workflow = Workflow {
+            id: "wf-resume-cleanup".to_string(),
+            steps: vec![StepDef {
+                name: "only".to_string(),
+                retry_policy: RetryPolicy {
+                    max_attempts: 1,
+                    backoff: Backoff::Fixed(Duration::from_millis(1)),
+                },
+                timeout: None,
+            }],
+        };
+
+        engine
+            .run(workflow, vec![body])
+            .await
+            .expect("run should pause at waiting step");
+        assert!(
+            !dropped.load(Ordering::SeqCst),
+            "step body must still be retained while the workflow is waiting"
+        );
+
+        let result = engine
+            .resume("wf-resume-cleanup", 0, "approved".to_string())
+            .await;
+        assert!(
+            matches!(result, Err(EngineError::WorkflowFailed { .. })),
+            "resumed attempt should exhaust its retry policy and fail the workflow"
+        );
+
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "workflow must be removed from in_flight after resume fails permanently"
+        );
     }
 }
