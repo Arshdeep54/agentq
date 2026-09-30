@@ -133,6 +133,9 @@ mod tests {
                         output: String::new(),
                     });
                 }
+                if let StepStatus::Waiting { .. } = row.status {
+                    return Ok(ClaimResult::AlreadyWaiting);
+                }
                 if let StepStatus::Leased {
                     worker_id: holder,
                     expires_at,

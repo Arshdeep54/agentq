@@ -265,9 +265,15 @@ impl<S: DurableStore> WorkflowEngine<S> {
             }
         }
 
-        self.store.append_event(&Event::WorkflowCompleted {
-            workflow_id: workflow_id.to_string(),
-        })?;
+        let events = self.store.load_events(workflow_id)?;
+        if !events
+            .iter()
+            .any(|e| matches!(e, Event::WorkflowCompleted { .. }))
+        {
+            self.store.append_event(&Event::WorkflowCompleted {
+                workflow_id: workflow_id.to_string(),
+            })?;
+        }
         self.in_flight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -354,6 +360,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
                         "step is held by another worker".into(),
                     )));
                 }
+                ClaimResult::AlreadyWaiting => return Ok(StepOutcome::Waiting),
                 ClaimResult::Claimed => {}
             }
 
@@ -774,5 +781,169 @@ mod tests {
         );
         let events = store.load_events("wf-wait").expect("load events");
         assert!(workflow_completed(&events));
+    }
+
+    fn count_workflow_completed(events: &[Event]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, Event::WorkflowCompleted { .. }))
+            .count()
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn sqlite_engine(store: crate::SqliteStore) -> WorkflowEngine<crate::SqliteStore> {
+        WorkflowEngine::new(
+            Queue::builder().start(),
+            store,
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        )
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn waiting_step_cannot_be_re_run_into_duplicate_side_effect() {
+        use std::sync::Arc;
+
+        let store = crate::SqliteStore::new(":memory:").expect("open db");
+        let engine = sqlite_engine(store);
+        let approval_runs = Arc::new(AtomicUsize::new(0));
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-wait-rerun".to_string(),
+            steps: vec![
+                StepDef {
+                    name: "first".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "approval".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+            ],
+        };
+
+        let make_bodies = |counter: Arc<AtomicUsize>| {
+            let step0: StepFunc = Box::new(|| Box::pin(async { Ok("first".to_string()) }));
+            let counter = counter.clone();
+            let step1: StepFunc = Box::new(move || {
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    if n == 0 {
+                        Err(Box::new(WaitForInput("needs approval".to_string()))
+                            as Box<dyn std::error::Error + Send + Sync>)
+                    } else {
+                        Ok("approved".to_string())
+                    }
+                })
+            });
+            vec![step0, step1]
+        };
+
+        engine
+            .run(workflow.clone(), make_bodies(approval_runs.clone()))
+            .await
+            .expect("first run should pause at waiting step");
+
+        assert_eq!(approval_runs.load(Ordering::SeqCst), 1);
+        let events = engine
+            .store()
+            .load_events("wf-wait-rerun")
+            .expect("load events");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::StepWaiting { step_index: 1, .. }))
+        );
+        assert_eq!(count_workflow_completed(&events), 0);
+
+        engine
+            .run(workflow.clone(), make_bodies(approval_runs.clone()))
+            .await
+            .expect("second run should not re-execute waiting step");
+
+        assert_eq!(
+            approval_runs.load(Ordering::SeqCst),
+            1,
+            "approval step must not run again while waiting"
+        );
+
+        engine
+            .resume("wf-wait-rerun", 1, "approved".to_string())
+            .await
+            .expect("resume should complete workflow");
+
+        assert_eq!(approval_runs.load(Ordering::SeqCst), 2);
+        let events = engine
+            .store()
+            .load_events("wf-wait-rerun")
+            .expect("load events");
+        assert_eq!(count_workflow_completed(&events), 1);
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn completed_workflow_cannot_accumulate_duplicate_completion_events() {
+        let store = crate::SqliteStore::new(":memory:").expect("open db");
+        let engine = sqlite_engine(store);
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-once-complete".to_string(),
+            steps: vec![
+                StepDef {
+                    name: "a".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "b".into(),
+                    retry_policy: no_retry,
+                    timeout: None,
+                },
+            ],
+        };
+
+        let bodies: Vec<StepFunc> = vec![
+            Box::new(|| Box::pin(async { Ok("a".to_string()) })),
+            Box::new(|| Box::pin(async { Ok("b".to_string()) })),
+        ];
+
+        engine
+            .run(workflow.clone(), bodies)
+            .await
+            .expect("workflow should complete");
+
+        let events = engine
+            .store()
+            .load_events("wf-once-complete")
+            .expect("load events");
+        assert_eq!(count_workflow_completed(&events), 1);
+
+        let bodies_again: Vec<StepFunc> = vec![
+            Box::new(|| Box::pin(async { Ok("a".to_string()) })),
+            Box::new(|| Box::pin(async { Ok("b".to_string()) })),
+        ];
+
+        engine
+            .run(workflow.clone(), bodies_again)
+            .await
+            .expect("re-run on completed workflow should succeed");
+
+        let events = engine
+            .store()
+            .load_events("wf-once-complete")
+            .expect("load events");
+        assert_eq!(count_workflow_completed(&events), 1);
     }
 }

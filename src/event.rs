@@ -51,4 +51,5 @@ pub enum ClaimResult {
     Claimed,
     AlreadyCompleted { output: String },
     HeldByOther,
+    AlreadyWaiting,
 }

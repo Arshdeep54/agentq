@@ -209,6 +209,9 @@ fn claim_step_tx(
                 output: row.output.clone().unwrap_or_default(),
             });
         }
+        if row.status == "waiting" {
+            return Ok(ClaimResult::AlreadyWaiting);
+        }
         if row.status == "leased" {
             if let (Some(holder), Some(exp_secs), Some(exp_nanos)) = (
                 row.worker_id.as_deref(),
