@@ -20,7 +20,8 @@ impl SqliteStore {
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 workflow_id TEXT NOT NULL,
-                payload TEXT NOT NULL
+                payload TEXT NOT NULL,
+                ts_millis INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_events_workflow ON events(workflow_id, id);
 
@@ -39,10 +40,57 @@ impl SqliteStore {
             ",
         )
         .map_err(|e| StoreError::Backend(e.to_string()))?;
+        ensure_events_ts_millis_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
     }
+
+    pub fn load_events_with_timestamps(
+        &self,
+        workflow_id: &str,
+    ) -> Result<Vec<(Event, i64)>, StoreError> {
+        let conn = lock_conn(self)?;
+        let mut stmt = conn
+            .prepare("SELECT payload, ts_millis FROM events WHERE workflow_id = ?1 ORDER BY id ASC")
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let rows = stmt
+            .query_map(params![workflow_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        let mut events = Vec::new();
+        for row in rows {
+            let (payload, ts_millis) = row.map_err(|e| StoreError::Backend(e.to_string()))?;
+            events.push((decode_event(&payload)?, ts_millis));
+        }
+        Ok(events)
+    }
+}
+
+fn ensure_events_ts_millis_column(conn: &Connection) -> Result<(), StoreError> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(events)")
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    let mut has_ts_millis = false;
+    for row in rows {
+        let name = row.map_err(|e| StoreError::Backend(e.to_string()))?;
+        if name == "ts_millis" {
+            has_ts_millis = true;
+            break;
+        }
+    }
+    if !has_ts_millis {
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN ts_millis INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|e| StoreError::Backend(e.to_string()))?;
+    }
+    Ok(())
 }
 
 fn lock_conn(store: &SqliteStore) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
@@ -56,13 +104,17 @@ impl DurableStore for SqliteStore {
     fn append_event(&self, event: &Event) -> Result<(), StoreError> {
         let workflow_id = event_workflow_id(event);
         let payload = encode_event(event);
+        let ts_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
         let mut conn = lock_conn(self)?;
         let tx = conn
             .transaction()
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         tx.execute(
-            "INSERT INTO events (workflow_id, payload) VALUES (?1, ?2)",
-            params![workflow_id, payload],
+            "INSERT INTO events (workflow_id, payload, ts_millis) VALUES (?1, ?2, ?3)",
+            params![workflow_id, payload, ts_millis],
         )
         .map_err(|e| StoreError::Backend(e.to_string()))?;
         apply_event_projection(&tx, event).map_err(|e| StoreError::Backend(e.to_string()))?;
@@ -775,6 +827,34 @@ mod tests {
             assert_eq!(encode_event(got), encode_event(want));
             assert_eq!(format!("{got:?}"), format!("{want:?}"));
         }
+    }
+
+    #[test]
+    fn append_events_timestamps_non_decreasing() {
+        let store = SqliteStore::new(":memory:").expect("open db");
+        let wf = "wf-ts";
+        store
+            .append_event(&Event::WorkflowStarted {
+                workflow_id: wf.to_string(),
+            })
+            .expect("append");
+        std::thread::sleep(Duration::from_millis(5));
+        store
+            .append_event(&Event::StepStarted {
+                workflow_id: wf.to_string(),
+                step_index: 0,
+                attempt: 0,
+            })
+            .expect("append");
+        let with_ts = store
+            .load_events_with_timestamps(wf)
+            .expect("load_events_with_timestamps");
+        assert_eq!(with_ts.len(), 2);
+        let ts0 = with_ts[0].1;
+        let ts1 = with_ts[1].1;
+        assert_ne!(ts0, 0);
+        assert_ne!(ts1, 0);
+        assert!(ts1 >= ts0);
     }
 
     #[test]
