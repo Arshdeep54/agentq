@@ -1422,6 +1422,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancel_during_retry_backoff_stops_before_next_attempt() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        );
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let workflow = Workflow {
+            id: "wf-cancel-during-backoff".to_string(),
+            steps: vec![StepDef {
+                name: "flaky".into(),
+                retry_policy: RetryPolicy {
+                    max_attempts: 3,
+                    backoff: Backoff::Fixed(Duration::from_millis(300)),
+                },
+                timeout: None,
+            }],
+        };
+
+        let step: StepFunc = Box::new(move || {
+            attempts_clone.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Err("transient failure".into()) })
+        });
+
+        let engine = Arc::new(engine);
+        let run_engine = engine.clone();
+        let run_handle = tokio::spawn(async move {
+            run_engine.run(workflow, vec![step]).await.expect("run");
+        });
+
+        // Give the first attempt time to fail and enter the retry backoff
+        // sleep, then cancel mid-backoff — before the second attempt fires.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        engine
+            .cancel("wf-cancel-during-backoff", "stop mid-backoff".to_string())
+            .await
+            .expect("cancel");
+        run_handle.await.expect("run task");
+
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "cancelling during retry backoff must prevent the next attempt from running"
+        );
+        let events = store
+            .load_events("wf-cancel-during-backoff")
+            .expect("load events");
+        assert_eq!(count_workflow_cancelled(&events), 1);
+        assert_eq!(count_workflow_completed(&events), 0);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::WorkflowFailed { .. })),
+            "cancellation during backoff must not also record a WorkflowFailed"
+        );
+    }
+
+    #[tokio::test]
     async fn cancel_while_waiting_blocks_resume() {
         let queue = Queue::builder().start();
         let store = MemStore::new();
