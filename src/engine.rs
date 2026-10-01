@@ -66,6 +66,7 @@ pub struct WorkflowEngine<S: DurableStore> {
     priority: Priority,
     in_flight: Mutex<HashMap<String, RunningWorkflow>>,
     resume_inputs: Mutex<HashMap<(String, usize), String>>,
+    terminal_write: Mutex<()>,
 }
 
 struct RunningWorkflow {
@@ -132,6 +133,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
             priority,
             in_flight: Mutex::new(HashMap::new()),
             resume_inputs: Mutex::new(HashMap::new()),
+            terminal_write: Mutex::new(()),
         }
     }
 
@@ -202,6 +204,11 @@ impl<S: DurableStore> WorkflowEngine<S> {
     /// is observed at the next step boundary (and between retry attempts for
     /// the current step); a body already running on the queue is not stopped.
     pub async fn cancel(&self, workflow_id: &str, reason: String) -> Result<(), EngineError> {
+        let _terminal_guard = self
+            .terminal_write
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
         let events = self.store.load_events(workflow_id)?;
         if workflow_has_terminal_event(&events) {
             return Ok(());
@@ -341,11 +348,17 @@ impl<S: DurableStore> WorkflowEngine<S> {
             }
         }
 
-        let events = self.store.load_events(workflow_id)?;
-        if !workflow_has_terminal_event(&events) {
-            self.store.append_event(&Event::WorkflowCompleted {
-                workflow_id: workflow_id.to_string(),
-            })?;
+        {
+            let _terminal_guard = self
+                .terminal_write
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let events = self.store.load_events(workflow_id)?;
+            if !workflow_has_terminal_event(&events) {
+                self.store.append_event(&Event::WorkflowCompleted {
+                    workflow_id: workflow_id.to_string(),
+                })?;
+            }
         }
         self.in_flight
             .lock()
@@ -1633,6 +1646,77 @@ mod tests {
         let events = store.load_events("wf-cancel-done").expect("load");
         assert_eq!(count_workflow_cancelled(&events), 0);
         assert_eq!(count_workflow_completed(&events), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_cancel_and_completion_yield_one_terminal_event() {
+        let queue = Queue::builder().start();
+        let store = MemStore::new();
+        let engine = Arc::new(WorkflowEngine::new(
+            queue,
+            store.clone(),
+            "worker-1".to_string(),
+            Duration::from_secs(60),
+            Priority::High,
+        ));
+
+        let mut handles = Vec::new();
+        for i in 0..300 {
+            let workflow_id = format!("wf-race-{i}");
+            let no_retry = RetryPolicy {
+                max_attempts: 1,
+                backoff: Backoff::Fixed(Duration::from_millis(1)),
+            };
+            let workflow = Workflow {
+                id: workflow_id.clone(),
+                steps: vec![StepDef {
+                    name: "only".into(),
+                    retry_policy: no_retry,
+                    timeout: None,
+                }],
+            };
+
+            let run_engine = engine.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = run_engine
+                    .run(
+                        workflow,
+                        vec![Box::new(|| Box::pin(async { Ok("done".to_string()) }))],
+                    )
+                    .await;
+            }));
+
+            let cancel_engine = engine.clone();
+            handles.push(tokio::spawn(async move {
+                let _ = cancel_engine
+                    .cancel(&workflow_id, "racing cancel".to_string())
+                    .await;
+            }));
+        }
+
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        for i in 0..300 {
+            let workflow_id = format!("wf-race-{i}");
+            let events = store.load_events(&workflow_id).expect("load events");
+            let terminal_count = events
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Event::WorkflowCompleted { .. }
+                            | Event::WorkflowCancelled { .. }
+                            | Event::WorkflowFailed { .. }
+                    )
+                })
+                .count();
+            assert!(
+                terminal_count <= 1,
+                "workflow {workflow_id} got {terminal_count} terminal events, expected at most 1: {events:?}"
+            );
+        }
     }
 
     #[tokio::test]
