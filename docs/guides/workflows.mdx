@@ -96,6 +96,33 @@ most recent `resume` supplied. `resume` is deliberately opaque about what
 `input` means — agentq doesn't know or care whether it's an approval, a
 webhook payload, or something else entirely.
 
+## Failing without retrying
+
+Not every failure is worth retrying — bad input or a 4xx from a downstream
+API won't fix itself on attempt two. A step returns `NonRetryable` instead
+of a plain error to skip the rest of its `RetryPolicy` and fail the whole
+workflow immediately:
+
+```rust
+use agentq::NonRetryable;
+
+Box::new(|| Box::pin(async {
+    Err(Box::new(NonRetryable("invalid recipient address".to_string()))
+        as Box<dyn std::error::Error + Send + Sync>)
+}))
+```
+
+This records `StepFailed` then `WorkflowFailed` right away, with no
+`RetryScheduled` in between, regardless of how many attempts
+`RetryPolicy::max_attempts` would otherwise allow.
+
+## Cancelling a workflow
+
+`engine.cancel(workflow_id, reason).await?` stops a workflow — idempotent,
+so cancelling twice is harmless. It doesn't abort a step attempt that's
+already been pushed to the queue (that job still runs to completion), but
+no further step starts afterward.
+
 ## Recovering from a dead worker
 
 If a worker crashes mid-step, its lease on that step eventually expires. On
