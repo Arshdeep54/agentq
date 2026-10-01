@@ -20,10 +20,24 @@ touches workflows sees zero difference after upgrading.
   `run` pauses the whole workflow there rather than failing it;
   `WorkflowEngine::resume` supplies the missing input and continues through
   the remaining steps.
+- **Non-retryable failures.** A step can return `NonRetryable` to fail the
+  whole workflow immediately, skipping the rest of its `RetryPolicy`'s
+  attempts — for errors that retrying can't fix (bad input, a 4xx from a
+  downstream API).
+- **Per-step timeouts.** `StepDef::timeout` is now enforced — an attempt
+  that runs past its timeout is treated as a failure and retried like any
+  other. The original job keeps running in the background after a timeout;
+  see [Durable store](/architecture/durable-store) and the CHANGELOG for
+  the exact tradeoff this makes.
+- **Cancellation.** `WorkflowEngine::cancel` idempotently stops a workflow.
+  A step attempt already pushed to the queue isn't aborted, but no further
+  step runs afterward.
 - **`DurableStore`.** A trait for where step status and event history live.
   `SqliteStore` ships as the one concrete implementation, behind the
   optional `sqlite` Cargo feature — off by default, so a consumer who only
-  wants the raw `Queue` never pulls in `rusqlite`.
+  wants the raw `Queue` never pulls in `rusqlite`. It also records each
+  event's timestamp (`SqliteStore::load_events_with_timestamps`), with
+  existing databases migrated automatically.
 - **Recovery.** `agentq::recover` finds steps whose worker died mid-lease
   (via `DurableStore::expired_leases`) and re-admits them, once you've
   re-registered the workflow's bodies with `WorkflowEngine::
@@ -37,7 +51,7 @@ together, and [Durable store](/architecture/durable-store) for how
 
 ```toml
 [dependencies]
-agentq = { version = "0.1", features = ["sqlite"] }
+agentq = { version = "0.2", features = ["sqlite"] }
 ```
 
 Without the `sqlite` feature, nothing changes from V1 — `rusqlite` never
