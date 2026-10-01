@@ -52,7 +52,7 @@ primitives that stop the bleeding, embedded directly in your binary.
 
 ```toml
 [dependencies]
-agentq = "0.1"
+agentq = "0.2"
 ```
 
 ```rust
@@ -83,7 +83,7 @@ feature:
 
 ```toml
 [dependencies]
-agentq = { version = "0.1", features = ["sqlite"] }
+agentq = { version = "0.2", features = ["sqlite"] }
 ```
 
 ```rust
