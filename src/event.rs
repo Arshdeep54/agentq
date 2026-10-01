@@ -1,5 +1,4 @@
 #[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize))]
 pub enum Event {
     WorkflowStarted {
         workflow_id: String,

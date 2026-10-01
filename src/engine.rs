@@ -297,6 +297,10 @@ impl<S: DurableStore> WorkflowEngine<S> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(workflow_id);
+        self.resume_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(wf_id, _), _| wf_id != workflow_id);
     }
 
     /// Runs steps `start_index..` in order. Returns `Ok(())` whether the
@@ -338,10 +342,7 @@ impl<S: DurableStore> WorkflowEngine<S> {
         }
 
         let events = self.store.load_events(workflow_id)?;
-        if !events
-            .iter()
-            .any(|e| matches!(e, Event::WorkflowCompleted { .. }))
-        {
+        if !workflow_has_terminal_event(&events) {
             self.store.append_event(&Event::WorkflowCompleted {
                 workflow_id: workflow_id.to_string(),
             })?;
@@ -514,17 +515,20 @@ impl<S: DurableStore> WorkflowEngine<S> {
                         return Ok(StepOutcome::Waiting);
                     }
 
-                    if parse_non_retryable_reason(&reason).is_some() {
+                    if let Some(non_retryable_reason) = parse_non_retryable_reason(&reason) {
+                        let stripped_reason = non_retryable_reason.to_string();
                         self.store.append_event(&Event::StepFailed {
                             workflow_id: workflow_id.to_string(),
                             step_index,
-                            reason: reason.clone(),
+                            reason: stripped_reason.clone(),
                         })?;
                         self.store.append_event(&Event::WorkflowFailed {
                             workflow_id: workflow_id.to_string(),
-                            reason: reason.clone(),
+                            reason: stripped_reason.clone(),
                         })?;
-                        return Err(EngineError::WorkflowFailed { reason });
+                        return Err(EngineError::WorkflowFailed {
+                            reason: stripped_reason,
+                        });
                     }
 
                     self.store.append_event(&Event::StepFailed {
@@ -1459,8 +1463,6 @@ mod tests {
             run_engine.run(workflow, vec![step]).await.expect("run");
         });
 
-        // Give the first attempt time to fail and enter the retry backoff
-        // sleep, then cancel mid-backoff — before the second attempt fires.
         tokio::time::sleep(Duration::from_millis(100)).await;
         engine
             .cancel("wf-cancel-during-backoff", "stop mid-backoff".to_string())
