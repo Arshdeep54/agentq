@@ -332,22 +332,11 @@ fn load_step_row(
 fn apply_event_projection(tx: &Transaction, event: &Event) -> Result<(), rusqlite::Error> {
     match event {
         Event::WorkflowStarted { .. } => Ok(()),
-        Event::StepStarted {
-            workflow_id,
-            step_index,
-            attempt,
-        } => upsert_step_status(
-            tx,
-            workflow_id,
-            *step_index,
-            "pending",
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(*attempt as i64),
-        ),
+        // claim_step already wrote status='leased' with the real worker_id and
+        // lease expiry for this attempt; this projection must not touch the row,
+        // or it erases the lease the moment the step starts and expired_leases()
+        // can never find it again after a crash.
+        Event::StepStarted { .. } => Ok(()),
         Event::StepCompleted {
             workflow_id,
             step_index,
@@ -866,5 +855,34 @@ mod tests {
         assert!(matches!(first, ClaimResult::Claimed));
         let second = store.claim_step(wf, 0, "worker-b", ttl).expect("claim");
         assert!(matches!(second, ClaimResult::HeldByOther));
+    }
+
+    #[test]
+    fn step_started_event_does_not_erase_lease() {
+        let store = SqliteStore::new(":memory:").expect("open db");
+        let wf = "wf-lease-survives-start";
+
+        let claimed = store
+            .claim_step(wf, 0, "worker-a", Duration::from_secs(0))
+            .expect("claim");
+        assert!(matches!(claimed, ClaimResult::Claimed));
+
+        store
+            .append_event(&Event::StepStarted {
+                workflow_id: wf.to_string(),
+                step_index: 0,
+                attempt: 0,
+            })
+            .expect("append StepStarted");
+
+        let expired = store.expired_leases().expect("expired_leases");
+        assert_eq!(
+            expired.len(),
+            1,
+            "StepStarted's projection must not clear the lease claim_step just wrote"
+        );
+        assert_eq!(expired[0].workflow_id, wf);
+        assert_eq!(expired[0].step_index, 0);
+        assert_eq!(expired[0].worker_id, "worker-a");
     }
 }
