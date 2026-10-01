@@ -5,8 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::{
-    Accepted, ClaimResult, DurableStore, Event, Job, JobLost, JobResult, Outcome, Priority,
-    PushError, Queue, RetryPolicy, StepDef, StepFunc, StepStatus, StoreError, Workflow,
+    Accepted, ClaimResult, DurableStore, Event, Job, JobHandle, JobLost, JobResult, Outcome,
+    Priority, PushError, Queue, RetryPolicy, StepDef, StepFunc, StepStatus, StoreError, Workflow,
 };
 
 type SharedStepFunc =
@@ -444,6 +444,107 @@ impl<S: DurableStore> WorkflowEngine<S> {
     /// reads it once the engine retries under a new key. A timeout can therefore
     /// leave an orphaned execution whose side effects still occur with no event
     /// recorded for that run.
+    async fn await_job_renewing_lease(
+        &self,
+        workflow_id: &str,
+        step_index: usize,
+        handle: JobHandle,
+        step_timeout: Option<Duration>,
+    ) -> Result<Outcome, EngineError> {
+        let renewal_interval = {
+            let every = self.lease_ttl / 3;
+            if every.is_zero() {
+                Duration::from_millis(1)
+            } else {
+                every
+            }
+        };
+        let (renew_tx, mut renew_rx) = tokio::sync::mpsc::unbounded_channel();
+        let renewal_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(renewal_interval);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                if renew_tx.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let renewal_abort = renewal_handle.abort_handle();
+
+        let outcome = if let Some(step_timeout) = step_timeout {
+            tokio::pin!(handle);
+            let deadline = tokio::time::sleep(step_timeout);
+            tokio::pin!(deadline);
+            loop {
+                tokio::select! {
+                    biased;
+                    res = handle.as_mut() => {
+                        renewal_abort.abort();
+                        break match res {
+                            Ok(outcome) => outcome,
+                            Err(err) => return Err(EngineError::JobLost(err)),
+                        };
+                    }
+                    () = &mut deadline => {
+                        renewal_abort.abort();
+                        break Outcome::Failed {
+                            reason: format!("step timed out after {:?}", step_timeout),
+                        };
+                    }
+                    Some(()) = renew_rx.recv() => {
+                        if let Err(err) = self.store.renew_lease(
+                            workflow_id,
+                            step_index,
+                            &self.worker_id,
+                            self.lease_ttl,
+                        ) {
+                            tracing::warn!(
+                                workflow_id,
+                                step_index,
+                                worker_id = %self.worker_id,
+                                error = %err,
+                                "step lease renewal failed"
+                            );
+                        }
+                    }
+                }
+            }
+        } else {
+            tokio::pin!(handle);
+            loop {
+                tokio::select! {
+                    biased;
+                    res = handle.as_mut() => {
+                        renewal_abort.abort();
+                        break match res {
+                            Ok(outcome) => outcome,
+                            Err(err) => return Err(EngineError::JobLost(err)),
+                        };
+                    }
+                    Some(()) = renew_rx.recv() => {
+                        if let Err(err) = self.store.renew_lease(
+                            workflow_id,
+                            step_index,
+                            &self.worker_id,
+                            self.lease_ttl,
+                        ) {
+                            tracing::warn!(
+                                workflow_id,
+                                step_index,
+                                worker_id = %self.worker_id,
+                                error = %err,
+                                "step lease renewal failed"
+                            );
+                        }
+                    }
+                }
+            }
+        };
+
+        Ok(outcome)
+    }
+
     async fn run_step(
         &self,
         workflow_id: &str,
@@ -494,20 +595,9 @@ impl<S: DurableStore> WorkflowEngine<S> {
                 Err(err) => return Err(EngineError::Push(err)),
             };
 
-            let outcome = if let Some(step_timeout) = step.timeout {
-                match tokio::time::timeout(step_timeout, handle).await {
-                    Ok(Ok(outcome)) => outcome,
-                    Ok(Err(err)) => return Err(EngineError::JobLost(err)),
-                    Err(_) => Outcome::Failed {
-                        reason: format!("step timed out after {:?}", step_timeout),
-                    },
-                }
-            } else {
-                match handle.await {
-                    Ok(outcome) => outcome,
-                    Err(err) => return Err(EngineError::JobLost(err)),
-                }
-            };
+            let outcome = self
+                .await_job_renewing_lease(workflow_id, step_index, handle, step.timeout)
+                .await?;
 
             match outcome {
                 Outcome::Completed { output } => {
@@ -1170,6 +1260,80 @@ mod tests {
             Duration::from_secs(60),
             Priority::High,
         )
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn sqlite_engine_with_lease(
+        store: crate::SqliteStore,
+        worker_id: &str,
+        lease_ttl: Duration,
+    ) -> WorkflowEngine<crate::SqliteStore> {
+        WorkflowEngine::new(
+            Queue::builder().start(),
+            store,
+            worker_id.to_string(),
+            lease_ttl,
+            Priority::High,
+        )
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn live_worker_renews_lease_so_other_worker_cannot_claim() {
+        use std::sync::Arc;
+
+        let store = crate::SqliteStore::new(":memory:").expect("open db");
+        let lease_ttl = Duration::from_millis(50);
+        let engine = Arc::new(sqlite_engine_with_lease(store, "worker-live", lease_ttl));
+
+        let step_started = Arc::new(tokio::sync::Notify::new());
+        let notify = step_started.clone();
+        let body: StepFunc = Box::new(move || {
+            let notify = notify.clone();
+            Box::pin(async move {
+                notify.notify_waiters();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok("done".to_string())
+            })
+        });
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-lease-renew".to_string(),
+            steps: vec![StepDef {
+                name: "slow".into(),
+                retry_policy: no_retry,
+                timeout: None,
+            }],
+        };
+
+        let run_handle = tokio::spawn({
+            let engine = Arc::clone(&engine);
+            let workflow = workflow.clone();
+            async move { engine.run(workflow, vec![body]).await }
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), step_started.notified())
+            .await
+            .expect("step should start within deadline");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let steal = engine
+            .store()
+            .claim_step("wf-lease-renew", 0, "worker-other", Duration::from_secs(60))
+            .expect("claim attempt");
+        assert!(
+            matches!(steal, ClaimResult::HeldByOther),
+            "renewing worker must keep the lease while the step is still running"
+        );
+
+        run_handle
+            .await
+            .expect("join workflow task")
+            .expect("workflow should complete");
     }
 
     #[cfg(feature = "sqlite")]
