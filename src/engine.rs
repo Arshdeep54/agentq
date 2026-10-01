@@ -65,7 +65,6 @@ pub struct WorkflowEngine<S: DurableStore> {
     lease_ttl: Duration,
     priority: Priority,
     in_flight: Mutex<HashMap<String, RunningWorkflow>>,
-    resume_inputs: Mutex<HashMap<(String, usize), String>>,
     terminal_write: Mutex<()>,
 }
 
@@ -132,7 +131,6 @@ impl<S: DurableStore> WorkflowEngine<S> {
             lease_ttl,
             priority,
             in_flight: Mutex::new(HashMap::new()),
-            resume_inputs: Mutex::new(HashMap::new()),
             terminal_write: Mutex::new(()),
         }
     }
@@ -260,14 +258,10 @@ impl<S: DurableStore> WorkflowEngine<S> {
             )
         };
 
-        self.resume_inputs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert((workflow_id.to_string(), step_index), input);
-
         self.store.append_event(&Event::StepResumed {
             workflow_id: workflow_id.to_string(),
             step_index,
+            input,
         })?;
         let attempt = current_attempt_from_events(&events, step_index);
 
@@ -304,10 +298,6 @@ impl<S: DurableStore> WorkflowEngine<S> {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(workflow_id);
-        self.resume_inputs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(wf_id, _), _| wf_id != workflow_id);
     }
 
     /// Runs steps `start_index..` in order. Returns `Ok(())` whether the
@@ -367,13 +357,27 @@ impl<S: DurableStore> WorkflowEngine<S> {
         Ok(())
     }
 
-    /// Opaque input supplied by the most recent [`Self::resume`] for this step, if any.
+    /// Opaque input from the most recent [`Event::StepResumed`] for this step in
+    /// durable storage, if any.
     pub fn resume_input(&self, workflow_id: &str, step_index: usize) -> Option<String> {
-        self.resume_inputs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&(workflow_id.to_string(), step_index))
-            .cloned()
+        let events = match self.store.load_events(workflow_id) {
+            Ok(events) => events,
+            Err(_) => return None,
+        };
+        let mut last = None;
+        for event in &events {
+            if let Event::StepResumed {
+                step_index: si,
+                input,
+                ..
+            } = event
+            {
+                if *si == step_index {
+                    last = Some(input.clone());
+                }
+            }
+        }
+        last
     }
 
     pub(crate) fn store(&self) -> &S {
@@ -1334,6 +1338,84 @@ mod tests {
             .await
             .expect("join workflow task")
             .expect("workflow should complete");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn resume_input_survives_simulated_restart_from_sqlite_log() {
+        let path = std::env::temp_dir().join(format!(
+            "agentq-resume-input-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let path_str = path
+            .to_str()
+            .expect("temp path must be valid UTF-8 for sqlite");
+
+        let store = crate::SqliteStore::new(path_str).expect("open db");
+        let engine = sqlite_engine(store);
+
+        let step1_attempts = AtomicUsize::new(0);
+        let step0: StepFunc = Box::new(|| Box::pin(async { Ok("first".to_string()) }));
+        let step1: StepFunc = Box::new(move || {
+            let n = step1_attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if n == 0 {
+                    Err(Box::new(WaitForInput("need approval".to_string()))
+                        as Box<dyn std::error::Error + Send + Sync>)
+                } else {
+                    Ok("approved".to_string())
+                }
+            })
+        });
+
+        let no_retry = RetryPolicy {
+            max_attempts: 1,
+            backoff: Backoff::Fixed(Duration::from_millis(1)),
+        };
+        let workflow = Workflow {
+            id: "wf-resume-input-restart".to_string(),
+            steps: vec![
+                StepDef {
+                    name: "first".into(),
+                    retry_policy: no_retry.clone(),
+                    timeout: None,
+                },
+                StepDef {
+                    name: "approval".into(),
+                    retry_policy: no_retry,
+                    timeout: None,
+                },
+            ],
+        };
+
+        engine
+            .run(workflow, vec![step0, step1])
+            .await
+            .expect("run should pause at waiting step");
+
+        let resume_text = "approved by human after restart";
+        engine
+            .resume("wf-resume-input-restart", 1, resume_text.to_string())
+            .await
+            .expect("resume should complete workflow");
+
+        drop(engine);
+
+        let store_after_restart =
+            crate::SqliteStore::new(path_str).expect("reopen db after simulated restart");
+        let engine_after_restart = sqlite_engine(store_after_restart);
+
+        assert_eq!(
+            engine_after_restart.resume_input("wf-resume-input-restart", 1),
+            Some(resume_text.to_string()),
+            "resume input must be read from durable events, not process memory"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[cfg(feature = "sqlite")]

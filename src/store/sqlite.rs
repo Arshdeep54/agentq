@@ -407,6 +407,7 @@ fn apply_event_projection(tx: &Transaction, event: &Event) -> Result<(), rusqlit
         Event::StepResumed {
             workflow_id,
             step_index,
+            input: _,
         } => {
             let attempt = current_attempt(tx, workflow_id, *step_index)?.unwrap_or(0);
             upsert_step_status(
@@ -580,10 +581,12 @@ fn encode_event(event: &Event) -> String {
         Event::StepResumed {
             workflow_id,
             step_index,
+            input,
         } => {
             lines.push("StepResumed".to_string());
             lines.push(escape_field(workflow_id));
             lines.push(step_index.to_string());
+            lines.push(escape_field(input));
         }
         Event::WorkflowCompleted { workflow_id } => {
             lines.push("WorkflowCompleted".to_string());
@@ -680,9 +683,11 @@ fn decode_event(payload: &str) -> Result<Event, StoreError> {
         "StepResumed" => {
             let workflow_id = read_field(&mut lines)?;
             let step_index = read_usize(&mut lines)?;
+            let input = read_field(&mut lines)?;
             Ok(Event::StepResumed {
                 workflow_id,
                 step_index,
+                input,
             })
         }
         "WorkflowCompleted" => {

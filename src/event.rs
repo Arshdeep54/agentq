@@ -31,6 +31,7 @@ pub enum Event {
     StepResumed {
         workflow_id: String,
         step_index: usize,
+        input: String,
     },
     WorkflowCompleted {
         workflow_id: String,
