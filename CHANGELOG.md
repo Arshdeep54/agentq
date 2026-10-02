@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+- Fix `NonRetryable` leaking a workflow into a terminal race with a
+  concurrent completion.
+- Lock `cancel` and step completion against each other so a cancellation
+  can't race a step that's finishing.
+- Fix a worker's lease being erased when a step starts, instead of renewed.
+- Renew the lease during step execution so long-running steps don't lose
+  their lease mid-flight.
+- Persist `resume`'s input in the durable event log.
+
 ## 0.2.0
 
 Durable workflows, built additively on top of V1's `Queue`. A V1 consumer
