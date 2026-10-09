@@ -124,6 +124,13 @@ mid-lease gets picked back up by `agentq::recover(&engine)`.
 crate ships, but a consumer who wants Postgres or an in-memory store for
 tests can implement it directly.
 
+## Example app
+
+[durable-agent](https://github.com/Arshdeep54/durable-agent) is a full
+application built on agentq: an AI support-ticket workflow that classifies
+tickets with an LLM, waits for email approval, and survives worker crashes
+mid-workflow.
+
 ## Caveats
 
 A job that pushes to its own queue and waits on the result can deadlock, if
